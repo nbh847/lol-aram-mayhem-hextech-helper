@@ -473,6 +473,20 @@ class UpdateDialog:
 
     def _select(self, mode):
         """选择更新模式并关闭对话框"""
+        # 爬虫类模式前置检测: 必须 Chrome 浏览器
+        # one_click 优先 GitHub 在线下载, 不强制检测; 其余爬虫模式必须先检测
+        crawler_modes = {'full', 'smart', 'spot_check', 'patch', 'precise'}
+        if mode in crawler_modes:
+            from scripts.hero_scraper import is_chrome_installed
+            if not is_chrome_installed():
+                messagebox.showerror(
+                    "未检测到 Chrome 浏览器",
+                    "本地爬取需要 Google Chrome 浏览器, 但未在系统中检测到。\n\n"
+                    "请先安装 Chrome: https://www.google.com/chrome/\n\n"
+                    "或改用「🚀 一键更新」(优先在线下载, 无需 Chrome)。",
+                    parent=self.dlg,
+                )
+                return  # 不关闭对话框, 不触发更新
         # 全量更新确认: 全量爬取耗时 10-20 分钟, 任何情况下都先让用户确认
         if mode == 'full':
             from datetime import datetime

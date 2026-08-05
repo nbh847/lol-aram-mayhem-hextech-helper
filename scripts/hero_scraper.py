@@ -2,6 +2,7 @@ import time
 import random
 import os
 import glob
+import shutil
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -9,6 +10,55 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
+
+
+# ==========================================
+# Chrome 浏览器检测
+# ==========================================
+def is_chrome_installed():
+    """
+    检测本机是否安装了 Chrome 浏览器。
+
+    Returns:
+        bool: 是否安装
+    """
+    # 1. 注册表 (Windows 最可靠)
+    try:
+        import winreg
+        reg_paths = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon"),
+        ]
+        for hive, path in reg_paths:
+            try:
+                with winreg.OpenKey(hive, path) as k:
+                    winreg.QueryValueEx(k, "version")
+                    return True
+            except OSError:
+                continue
+    except ImportError:
+        pass  # 非 Windows 平台
+
+    # 2. 常见安装路径
+    candidate_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    for p in candidate_paths:
+        if os.path.exists(p):
+            return True
+
+    # 3. PATH 中查找
+    if shutil.which("chrome") or shutil.which("google-chrome") or shutil.which("chromium-browser"):
+        return True
+
+    return False
+
 
 # ==========================================
 # ChromeDriver 查找与初始化
