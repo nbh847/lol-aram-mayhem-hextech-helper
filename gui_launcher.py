@@ -473,7 +473,7 @@ class UpdateDialog:
 
     def _select(self, mode):
         """选择更新模式并关闭对话框"""
-        # 全量更新冷却确认: 距上次全量不足24h时, 弹窗让用户确认是否强制
+        # 全量更新确认: 全量爬取耗时 10-20 分钟, 任何情况下都先让用户确认
         if mode == 'full':
             from datetime import datetime
             full_status = get_full_update_status()
@@ -481,15 +481,21 @@ class UpdateDialog:
             if last_full:
                 hours_since = (datetime.now() - last_full).total_seconds() / 3600
                 if hours_since < 24:
-                    confirm = messagebox.askyesno(
-                        "全量更新确认",
-                        f"📅 {hours_since:.1f} 小时前刚执行过全量更新 (< 24h)。\n\n"
-                        f"数据很可能已经是最新, 全量更新需要 10-20 分钟。\n\n"
-                        f"是否仍要强制全量更新?",
-                        parent=self.dlg,
-                    )
-                    if not confirm:
-                        return  # 用户取消, 不关闭对话框, 不触发更新
+                    msg = (f"📅 {hours_since:.1f} 小时前刚执行过全量更新 (< 24h)。\n\n"
+                           f"数据很可能已经是最新。\n\n"
+                           f"全量更新会重新爬取所有 173 个英雄, 耗时约 10-20 分钟。\n\n"
+                           f"是否仍要全量更新?")
+                else:
+                    msg = (f"📅 {full_status.get('message')}。\n\n"
+                           f"全量更新会重新爬取所有 173 个英雄, 耗时约 10-20 分钟。\n\n"
+                           f"是否开始全量更新?")
+            else:
+                msg = ("全量更新会重新爬取所有 173 个英雄, 耗时约 10-20 分钟。\n\n"
+                       "更新过程中可随时点「停止更新」终止。\n\n"
+                       "是否开始全量更新?")
+            confirm = messagebox.askyesno("全量更新确认", msg, parent=self.dlg)
+            if not confirm:
+                return  # 用户取消, 不关闭对话框, 不触发更新
         self.dlg.destroy()
         self.app._run_update(mode)
 
