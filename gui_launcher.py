@@ -1008,6 +1008,8 @@ class LauncherApp:
                 if success:
                     self._log("✅ 更新完成!")
                     self.gui_queue.put({"event": "reload_data"})
+                elif self.update_stop_event and self.update_stop_event.is_set():
+                    self._log("⏹ 更新已停止")
                 else:
                     self._log("⚠ 更新完成 (部分失败)")
             except Exception as e:
