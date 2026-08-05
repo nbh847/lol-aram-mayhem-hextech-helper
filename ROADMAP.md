@@ -42,6 +42,7 @@
 
 ## 最近验证
 
+- 2026-08-04：修复 `one_click_update()` 中错误的 `from scripts.config import update_pinyin_file`（该函数实际定义在 updater.py 自身），删除多余 import 改为直接调用。该 bug 导致 GitHub 在线下载成功后必然抛 ImportError 降级到本地爬取。冒烟验证 import 链打通，重新打包 `dist\build_1785931741\`，字节码确认无错误 import。
 - 2026-08-04：实现「全量更新」按钮二次确认（方案C）：`UpdateDialog._select()` 在 full 模式触发前检查距上次全量时间，不足 24 小时弹窗让用户确认；从 EXE 内嵌 CArchive 提取 `gui_launcher` 字节码，确认含二次确认文案；重新打包 `dist\build_1785853068\`，并复制最新全量数据 (29984 行)。
 - 2026-08-04：实现「全量冷却」保护（方案A）：`run_update()` 的 `spot_check` 分支在触发全量前检查距上次全量时间，不足 24 小时则跳过；四种场景单元验证通过（从未全量/1h前/25h前/24h边界）；重新打包 `dist\build_1785851777\`，字节码已含冷却逻辑文案。
 - 2026-08-04：定位并修复 `sync_official_data()` 接收 Riot 皮肤变体污染根因（Data Dragon 16.15.1 返回 60 条 `Jade_` 前缀条目）；改为过滤含下划线 key，保留 173 个真英雄；重新打包 `dist\build_1785849994\`，全面验证包内 `champions.json` 与源码一致、无 `Jade_` 污染，修复文案已编入 PYZ 字节码。
