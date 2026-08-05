@@ -9,7 +9,7 @@ import tkinter as tk
 import ctypes
 import msvcrt  # 用于清除输入缓冲区
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageTk
 import mss
 import keyboard
 from collections import defaultdict
@@ -33,6 +33,22 @@ def get_regions():
     }
 
 REGIONS = get_regions()
+
+def get_overlay_regions():
+    """
+    海克斯下方图片UI的显示区域 (以 2K 2560x1440 为基准等比缩放)。
+    top/width/height 为估算占位值, 需在真实游戏截图上确认后调整。
+    """
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+        W, H = mon['width'], mon['height']
+    return {
+        "hex_1": {'top': int(H * 0.50), 'left': int(W * 0.2539), 'width': int(W * 0.125), 'height': int(H * 0.10)},
+        "hex_2": {'top': int(H * 0.50), 'left': int(W * 0.4414), 'width': int(W * 0.125), 'height': int(H * 0.10)},
+        "hex_3": {'top': int(H * 0.50), 'left': int(W * 0.625),  'width': int(W * 0.125), 'height': int(H * 0.10)},
+    }
+
+OVERLAY_REGIONS = get_overlay_regions()
 
 COLORS = {
     "normal": "#00FF00",  # 绿色
@@ -353,14 +369,18 @@ class OverlayApp:
         self.root = root
         self.queue = queue
         self.labels = {}
+        self.image_labels = {}      # 图片UI专用 Label (与文字 Label 分离)
+        self.image_photos = {}      # 保持 PhotoImage 引用, 防止 GC 回收
+        self.templates = {}         # 缓存: {模板名: PIL.Image}
         self.hide_timer = None
-        
+
         # 先隐藏窗口，避免配置透明前闪白框
         self.root.withdraw()
         self._setup_window()
+        self._load_templates()
         self._setup_labels()
         self.root.deiconify()
-        
+
         # 启动队列消息监听
         self.root.after(100, self.process_queue)
 
@@ -391,6 +411,81 @@ class OverlayApp:
         for key in REGIONS:
             lbl = tk.Label(self.root, text="", font=font_style, bg=COLORS["bg"], justify="left")
             self.labels[key] = lbl
+            # 图片UI专用 Label
+            img_lbl = tk.Label(self.root, bg=COLORS["bg"])
+            self.image_labels[key] = img_lbl
+
+    def _load_templates(self):
+        """从 assets/templates/ 加载 PNG 模板。缺失不报错, 后续降级为不显示图片。"""
+        templates_dir = os.path.join(BASE_DIR, "assets", "templates")
+        if not os.path.isdir(templates_dir):
+            return
+        for name in os.listdir(templates_dir):
+            if not name.lower().endswith('.png'):
+                continue
+            key = os.path.splitext(name)[0]  # tier_棱彩 / tier_黄金 / ...
+            try:
+                self.templates[key] = Image.open(os.path.join(templates_dir, name)).convert("RGBA")
+            except Exception as e:
+                print(f"模板加载失败 {name}: {e}")
+
+    def _select_template(self, info):
+        """根据推荐信息选择模板名, 无匹配返回 None"""
+        if info.get("error"):
+            return None
+        tier = info.get("tier", "未知")
+        return f"tier_{tier}"
+
+    def _render_image_card(self, key, info):
+        """渲染下方图片UI: 选模板 → 贴文字 → 显示。模板缺失时静默跳过。"""
+        tpl_name = self._select_template(info)
+        if not tpl_name or tpl_name not in self.templates:
+            return  # 无模板, 不显示图片UI
+
+        img_lbl = self.image_labels[key]
+        region = OVERLAY_REGIONS[key]
+
+        try:
+            # 复制模板 (避免污染缓存), 缩放到目标区域尺寸
+            card = self.templates[tpl_name].copy()
+            card = card.resize((region['width'], region['height']), Image.LANCZOS)
+
+            # 贴排名文字 (居中)
+            from PIL import ImageDraw, ImageFont
+            draw = ImageDraw.Draw(card)
+            try:
+                font = ImageFont.truetype("msyh.ttc", int(region['height'] * 0.35))
+            except Exception:
+                font = ImageFont.load_default()
+
+            text = info.get("text", "")
+            tier = info.get("tier", "")
+            t_rank = info.get("t_rank", "?")
+            overall_rank = info.get("overall_rank", "?")
+            display_text = f"{tier} No.{t_rank}\n总 No.{overall_rank}"
+
+            # 居中绘制
+            bbox = draw.textbbox((0, 0), display_text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x = (card.width - tw) // 2 - bbox[0]
+            y = (card.height - th) // 2 - bbox[1]
+
+            # 文字颜色: highlight=金色, error=红色, 否则白色
+            if info.get("highlight"):
+                fill = (255, 215, 0, 255)
+            elif info.get("error"):
+                fill = (255, 51, 51, 255)
+            else:
+                fill = (255, 255, 255, 255)
+            draw.multiline_text((x, y), display_text, font=font, fill=fill, align="center")
+
+            photo = ImageTk.PhotoImage(card)
+            self.image_photos[key] = photo  # 防 GC
+            img_lbl.config(image=photo, text="")
+            img_lbl.place(x=region['left'] - self.offset_x, y=region['top'] - self.offset_y, anchor="nw")
+            img_lbl.lift()
+        except Exception as e:
+            print(f"图片UI渲染失败 ({key}): {e}")
 
     def process_queue(self):
         """主线程轮询：处理来自后台线程的指令"""
@@ -417,6 +512,8 @@ class OverlayApp:
             self.hide_timer = None
         for lbl in self.labels.values():
             lbl.place_forget()
+        for img_lbl in self.image_labels.values():
+            img_lbl.place_forget()
 
     def show_status(self, text):
         self.clear_display()
@@ -428,14 +525,14 @@ class OverlayApp:
 
     def update_display(self, results):
         self.clear_display()
-        
-        # 强制对齐 Y 轴
+
+        # 强制对齐 Y 轴 (文字位置: 海克斯图标和名字的中间)
         base_y_abs = REGIONS['hex_1']['top']
-        fixed_rel_y = base_y_abs - self.offset_y - 120
+        fixed_rel_y = base_y_abs - self.offset_y - 60
 
         for key, info in results.items():
             if not info.get("text"): continue
-            
+
             lbl = self.labels[key]
             # 颜色逻辑
             if info["error"]:
@@ -444,12 +541,15 @@ class OverlayApp:
                 fg = COLORS["best"]
             else:
                 fg = COLORS["normal"]
-            
+
             lbl.config(text=info["text"], fg=fg)
-            
+
             r_left = REGIONS[key]['left'] - self.offset_x
             lbl.place(x=r_left, y=fixed_rel_y, anchor="nw")
             lbl.lift()
+
+            # 渲染下方图片UI
+            self._render_image_card(key, info)
 
         # 结果显示5秒后消失
         self.hide_timer = self.root.after(5000, self.clear_display)

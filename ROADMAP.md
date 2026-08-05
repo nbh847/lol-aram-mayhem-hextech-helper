@@ -26,6 +26,7 @@
 - 已新增「全量更新」按钮二次确认：点「全量更新」时若距上次全量不足 24 小时，弹窗提示「数据可能已最新，是否仍要强制全量？」，用户取消则不执行，确认则强制全量。保留强制出口的同时避免误触浪费时间。
 - 已改为「全量更新」永远弹窗确认：不再依赖 config.json 是否存在，三种场景区分文案（24h 内全量过/24h 前全量过/从未全量过）。
 - 已新增爬虫类更新模式前置 Chrome 检测：`full`/`smart`/`spot_check`/`patch`/`precise` 触发前调 `is_chrome_installed()`（注册表 + 常见路径 + PATH 三级检测），未装 Chrome 弹窗提示安装或改用一键更新。`one_click` 不检测（优先 GitHub 在线下载）。
+- 已新增海克斯推荐图片 UI 渲染框架（`main.py`）：新增 `OVERLAY_REGIONS` 常量定义下方图片位置；`OverlayApp` 新增 `_load_templates()`（从 `assets/templates/` 加载 PNG，按 `tier_棱彩.png` 命名）、`_select_template()`（按等级选模板）、`_render_image_card()`（PIL 贴文字到模板并显示）；模板缺失时静默降级为纯文字。现有排名文字位置上移到「图标和名字中间」（`base_y - 60`）。
 
 ## 进行中
 
