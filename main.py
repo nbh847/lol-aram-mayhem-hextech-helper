@@ -36,17 +36,34 @@ REGIONS = get_regions()
 
 def get_overlay_regions():
     """
-    海克斯下方图片UI的显示区域 (以 2K 2560x1440 为基准等比缩放)。
-    top/width/height 为估算占位值, 需在真实游戏截图上确认后调整。
+    海克斯下方图片UI的显示区域。
+    基于 REGIONS(海克斯名字OCR区) + 游戏内固定偏移推算, 而非独立屏幕比例。
+    这样只要 OCR 区对齐, 下方图片自动对齐, 换分辨率也稳定。
+
+    偏移量(相对海克斯名字 top, 以屏幕高度比例表达):
+      - OFFSET_DOWN_RATIO: 游戏内「名字」到「下方空白区」的固定距离 ≈ H * 0.125
+      - IMG_HEIGHT_RATIO:  图片高度 ≈ H * 0.09
+    (数值为初步估算, 需在真实游戏实测后微调)
     """
+    OFFSET_DOWN_RATIO = 0.125   # 名字top → 下方图片top 的偏移 (待游戏实测微调)
+    IMG_HEIGHT_RATIO = 0.09     # 图片高度
+
     with mss.mss() as sct:
         mon = sct.monitors[1]
         W, H = mon['width'], mon['height']
-    return {
-        "hex_1": {'top': int(H * 0.50), 'left': int(W * 0.2539), 'width': int(W * 0.125), 'height': int(H * 0.10)},
-        "hex_2": {'top': int(H * 0.50), 'left': int(W * 0.4414), 'width': int(W * 0.125), 'height': int(H * 0.10)},
-        "hex_3": {'top': int(H * 0.50), 'left': int(W * 0.625),  'width': int(W * 0.125), 'height': int(H * 0.10)},
-    }
+
+    img_h = int(H * IMG_HEIGHT_RATIO)
+    offset_down = int(H * OFFSET_DOWN_RATIO)
+    regions = get_regions()
+    overlay = {}
+    for key, r in regions.items():
+        overlay[key] = {
+            'left':   r['left'],            # X 与海克斯卡片对齐
+            'top':    r['top'] + offset_down,   # 基于OCR区top向下偏移
+            'width':  r['width'],           # 宽度复用海克斯卡片
+            'height': img_h,
+        }
+    return overlay
 
 OVERLAY_REGIONS = get_overlay_regions()
 
@@ -528,7 +545,11 @@ class OverlayApp:
 
         # 强制对齐 Y 轴 (文字位置: 海克斯图标和名字的中间)
         base_y_abs = REGIONS['hex_1']['top']
-        fixed_rel_y = base_y_abs - self.offset_y - 60
+        # 文字位置: 海克斯图标和名字的中间 = 名字上方约 H*0.04 (待游戏实测微调)
+        import mss as _mss
+        with _mss.mss() as _sct:
+            _H = _sct.monitors[1]['height']
+        fixed_rel_y = base_y_abs - self.offset_y - int(_H * 0.04)
 
         for key, info in results.items():
             if not info.get("text"): continue
