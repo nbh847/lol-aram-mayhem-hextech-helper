@@ -7,12 +7,13 @@ import requests
 import sys
 import re
 import random
-from pypinyin import lazy_pinyin 
+from datetime import datetime
+from pypinyin import lazy_pinyin
 
 # 1. 解决同级导入问题 (兼容直接运行和包导入)
 try:
     from scripts import hero_scraper as crawler
-    from scripts.config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from scripts.config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE, update_full_update_time, get_full_update_status
 except ImportError:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)
@@ -21,12 +22,15 @@ except ImportError:
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
     import hero_scraper as crawler
-    from config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE, update_full_update_time, get_full_update_status
 
 # GitHub 仓库地址 (用于在线下载)
-GITHUB_RAW_BASE  = "https://raw.githubusercontent.com/Nyx0ra/lol-aram-mayhem-hextech-helper/main"
+GITHUB_RAW_BASE  = "https://raw.githubusercontent.com/nbh847/lol-aram-mayhem-hextech-helper/main"
 
 CSV_HEADER       =["中文名", "英文名", "等级", "总排名", "等级内序号", "海克斯名称"]
+
+# 抽样差异触发全量时, 若距上次全量不足此小时数则跳过, 避免网络抖动导致的短时重复全量
+FULL_UPDATE_COOLDOWN_HOURS = 24
 
 # ================= 1. 数据真理同步 =================
 def sync_official_data():
@@ -41,7 +45,14 @@ def sync_official_data():
 
         official_en_to_cn = {}
         official_cn_to_en = {}
+        skipped_skin_variants = 0
         for en_id, info in data.items():
+            # 过滤皮肤/特殊变体 (如 Jade_Blitzcrank、Jade_Nunu)
+            # 标准英雄 id 均为纯字母、无下划线; 含下划线的 key 都是皮肤变体,
+            # 其 name 会与本体冲突并污染 cn_to_en 映射, OP.GG URL 也无法识别
+            if '_' in en_id:
+                skipped_skin_variants += 1
+                continue
             cn_name = info['name']
             official_en_to_cn[en_id] = cn_name
             official_cn_to_en[cn_name] = en_id
@@ -65,6 +76,8 @@ def sync_official_data():
                 renamed_champs.append(en_id)
         
         print(f"    同步完成。共 {len(official_en_to_cn)} 个英雄。")
+        if skipped_skin_variants:
+            print(f"    🚫 已过滤 {skipped_skin_variants} 个皮肤变体 (含下划线的 key, 如 Jade_Blitzcrank)")
         if new_champs:
             print(f"    🌟 发现 {len(new_champs)} 个全新英雄: {', '.join([official_en_to_cn[en] for en in new_champs])}")
         if renamed_champs:
@@ -285,21 +298,22 @@ def main():
 
 # ================= GUI API 接口 =================
 
-def run_update(mode='smart', log_func=None, official_data=None):
+def run_update(mode='smart', log_func=None, official_data=None, stop_event=None):
     """
     供 GUI 和 CLI 调用的统一更新接口。
-    
+
     Args:
         mode: 'smart' | 'full' | 'patch' | 'spot_check'
         log_func: 日志回调函数 log_func(message: str)
         official_data: (英文到中文, 中文到英文, 新英雄, 改名英雄) 元组，
                        如已提前同步可传入避免重复请求
-    
+        stop_event: threading.Event，用于停止更新
+
     Returns:
         bool: 是否成功
     """
     _log = log_func or print
-    
+
     try:
         # 1. 同步官方数据 (或使用已有数据)
         if official_data:
@@ -313,78 +327,111 @@ def run_update(mode='smart', log_func=None, official_data=None):
             _log(f"✅ 同步完成: {len(official_en_to_cn)} 个英雄")
             update_pinyin_file(official_cn_to_en)
             _log("✅ 拼音文件已更新")
-        
+
         # 2. 加载历史数据
         history_data = load_csv_history()
         missing_champs = [en for en in official_en_to_cn if en not in history_data]
         target_list = []
         new_crawl_data = {}
-        
+
         # 3. 根据模式构建目标列表
         if mode == 'full':
             _log("模式: 全量更新")
             target_list = [(cn, en) for en, cn in official_en_to_cn.items()]
-        
+
         elif mode == 'spot_check':
             _log("模式: 抽样校验")
             has_diff, sample_data = spot_check_and_update(official_en_to_cn, history_data)
             if has_diff:
+                # 抽样差异可能是网络波动导致的误判, 若距上次全量不足冷却时间则跳过
+                full_status = get_full_update_status()
+                last_full = full_status.get('last_update')
+                if last_full:
+                    hours_since = (datetime.now() - last_full).total_seconds() / 3600
+                    if hours_since < FULL_UPDATE_COOLDOWN_HOURS:
+                        _log(
+                            f"⏭ 检测到差异, 但 {hours_since:.1f} 小时前刚全量过 (< {FULL_UPDATE_COOLDOWN_HOURS}h), "
+                            f"差异可能是网络波动, 跳过本次全量。如需强制更新请用「全量更新」按钮"
+                        )
+                        return True
                 _log("🔄 检测到数据差异，触发全量更新...")
                 target_list = [(cn, en) for en, cn in official_en_to_cn.items()]
             else:
                 _log("✅ 抽样数据与本地一致，无需更新")
                 return True
-        
+
         elif mode == 'patch':
             _log("模式: 极速补漏")
             target_list = [(official_en_to_cn[en], en) for en in missing_champs]
-        
+
         else:  # smart
             _log("模式: 智能增量")
             targets = set(new_champs + renamed_champs + missing_champs)
             target_list = [(official_en_to_cn[en], en) for en in targets]
-        
+
         # 4. 执行爬取
+        # 🛑 执行爬取前检查停止信号
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止更新，丢弃已爬取数据")
+            return False
+
         if target_list:
             _log(f"准备爬取 {len(target_list)} 个英雄...")
-            new_crawl_data, failed_list = crawler.crawl_champions(target_list)
+            new_crawl_data, failed_list = crawler.crawl_champions(target_list, stop_event=stop_event)
             if failed_list:
                 _log(f"⚠ 爬取失败的英雄: {', '.join(failed_list)}")
         elif not new_crawl_data:
             _log("无需爬取")
-        
+
+        # 🛑 爬取后检查停止信号（决定是否保存）
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止更新，丢弃已爬取数据")
+            return False
+
         # 5. 合并保存
         merge_and_save(official_en_to_cn, history_data, new_crawl_data)
         _log("✅ 数据合并保存完成")
-        return True
         
+        # 如果是全量更新，记录更新时间
+        if mode == 'full':
+            update_full_update_time()
+            _log("📅 已记录全量更新时间")
+        
+        return True
+
     except Exception as e:
         _log(f"❌ 更新失败: {e}")
         return False
 
 
-def download_from_github(log_func=None):
+def download_from_github(log_func=None, stop_event=None):
     """
     从 GitHub 仓库下载最新数据文件。
-    
+
     Args:
         log_func: 日志回调函数
-    
+        stop_event: threading.Event，用于停止下载
+
     Returns:
         bool: 是否全部成功
     """
     _log = log_func or print
-    
+
     files_to_download = [
         ("data/hero_augments.csv", CSV_FILE, "英雄海克斯数据"),
         ("data/champions.json", CHAMPION_ID_FILE, "英雄名称映射"),
         ("data/pinyin_map.json", PINYIN_FILE, "拼音检索索引"),
     ]
-    
+
     success_count = 0
     total = len(files_to_download)
-    
+
     for idx, (remote_path, local_path, desc) in enumerate(files_to_download, 1):
+        # 🛑 每个文件下载前检查停止信号
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止下载，丢弃已下载文件")
+            return False
+
         url = f"{GITHUB_RAW_BASE}/{remote_path}"
         _log(f"下载中 [{idx}/{total}]: {desc}...")
         try:
@@ -399,18 +446,63 @@ def download_from_github(log_func=None):
                 _log(f"❌ {desc} 下载失败 (HTTP {resp.status_code})")
         except Exception as e:
             _log(f"❌ {desc} 下载异常: {e}")
-    
+
     _log(f"下载完成: {success_count}/{total} 成功")
     return success_count == total
 
 
-def update_specific_heroes(hero_names, log_func=None):
+def one_click_update(log_func=None, stop_event=None):
+    """
+    一键更新：自动选择最优方案。
+    降级链：GitHub 在线下载 → 本地抽样校验 → 报错
+
+    Args:
+        log_func: 日志回调函数
+        stop_event: threading.Event，用于停止更新
+
+    Returns:
+        bool: 是否成功
+    """
+    _log = log_func or print
+
+    # Step 1: GitHub 在线下载
+    _log("🌐 [1/2] 尝试在线下载最新数据...")
+    try:
+        if download_from_github(log_func=_log, stop_event=stop_event):
+            _log("✅ 在线下载成功，同步官方英雄数据...")
+            # 下载成功后也要同步官方数据，确保英雄列表是最新的
+            from scripts.config import update_pinyin_file
+            official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = sync_official_data()
+            if official_en_to_cn:
+                update_pinyin_file(official_cn_to_en)
+                _log(f"✅ 官方数据同步完成: {len(official_en_to_cn)} 个英雄")
+                if new_champs:
+                    _log(f"🌟 发现 {len(new_champs)} 个新英雄，建议执行'智能增量更新'获取海克斯数据")
+                if renamed_champs:
+                    _log(f"✏️ 发现 {len(renamed_champs)} 个改名英雄")
+            return True
+        _log("⚠ 在线下载未完全成功，尝试本地爬取...")
+    except Exception as e:
+        _log(f"⚠ 在线下载失败: {e}，尝试本地爬取...")
+
+    # Step 2: 本地抽样校验（内部会自动判断是否需要全量）
+    _log("🔍 [2/2] 尝试本地抽样校验...")
+    try:
+        return run_update(mode='spot_check', log_func=_log, stop_event=stop_event)
+    except Exception as e:
+        _log(f"❌ 本地爬取失败: {e}")
+        _log("💡 建议：1) 检查网络；2) 安装 Chrome 浏览器；3) 联系技术支持")
+        return False
+
+
+def update_specific_heroes(hero_names, log_func=None, stop_event=None):
     """
     精确更新指定英雄的数据。
     
     Args:
         hero_names: 英雄名称列表 (中文或英文)
         log_func: 日志回调函数
+        stop_event: threading.Event，用于停止更新
     
     Returns:
         bool: 是否成功
@@ -467,7 +559,18 @@ def update_specific_heroes(hero_names, log_func=None):
         
         _log(f"准备爬取 {len(target_list)} 个英雄...")
         history_data = load_csv_history()
-        new_crawl_data, failed_list = crawler.crawl_champions(target_list)
+        
+        # 🛑 执行爬取前检查停止信号
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止更新，丢弃已爬取数据")
+            return False
+            
+        new_crawl_data, failed_list = crawler.crawl_champions(target_list, stop_event=stop_event)
+        
+        # 🛑 爬取后检查停止信号（决定是否保存）
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止更新，丢弃已爬取数据")
+            return False
         
         if failed_list:
             _log(f"⚠ 爬取失败: {', '.join(failed_list)}")

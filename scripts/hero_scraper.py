@@ -180,12 +180,34 @@ def click_tab_and_wait(driver, tab_text, prev_names=None):
 # ==========================================
 # 单个英雄抓取逻辑 (数据源: OP.GG) — 优化版
 # ==========================================
-def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
+def scrape_single_champion(driver, cn_name, en_name, is_first_page=False, stop_event=None):
+    """
+    单个英雄抓取逻辑
+    
+    Args:
+        driver: Selenium WebDriver 实例
+        cn_name: 英雄中文名
+        en_name: 英雄英文名
+        is_first_page: 是否为第一个英雄（需要处理cookie弹窗）
+        stop_event: threading.Event，用于停止检查
+    
+    Returns:
+        (list, str): (海克斯数据列表, 状态码)
+    """
     url = f"https://op.gg/zh-cn/lol/modes/aram-mayhem/{en_name}/augments"
     print(f"[{cn_name}] 正在处理: {url}")
 
     try:
+        # 🛑 driver.get() 前检查停止信号
+        if stop_event and stop_event.is_set():
+            return [], 'stopped'
+        
         driver.get(url)
+        
+        # 🛑 WebDriverWait 前检查停止信号
+        if stop_event and stop_event.is_set():
+            return [], 'stopped'
+            
         # 等待海克斯列表出现（而非仅等 body 标签）
         WebDriverWait(driver, 12).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, _AUGMENT_SELECTOR))
@@ -201,6 +223,11 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
 
         # 1. 提取「全部」Tab 数据（页面默认就是全部 Tab）
         print(f"   > 提取「全部」排名...")
+        
+        # 🛑 Tab切换前检查停止信号
+        if stop_event and stop_event.is_set():
+            return [], 'stopped'
+        
         # 先确保在全部 Tab
         click_tab_and_wait(driver, "全部")
         all_names = extract_augment_names_fast(driver)
@@ -269,10 +296,14 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
 # ==========================================
 # 批量抓取入口
 # ==========================================
-def crawl_champions(target_list, early_stop_func=None):
+def crawl_champions(target_list, early_stop_func=None, stop_event=None):
     """
     直接返回内存字典，不再写临时文件
-    early_stop_func: 接收 (cn_name, crawled_data) 返回 bool，若返回 True 则提前终止抓取
+    
+    Args:
+        target_list: 英雄列表 [(中文名, 英文名), ...]
+        early_stop_func: 早期停止回调，接收 (cn_name, crawled_data) 返回 bool，若返回 True 则提前终止抓取
+        stop_event: threading.Event，用于用户主动停止
     """
     print(f"--- 开始抓取 {len(target_list)} 个英雄 ---")
 
@@ -286,6 +317,11 @@ def crawl_champions(target_list, early_stop_func=None):
     try:
         total = len(target_list)
         for i, (cn_name, en_name) in enumerate(target_list, 1):
+            # 🛑 每个英雄前检查停止信号
+            if stop_event and stop_event.is_set():
+                print("   > ⚠️ 用户停止更新，丢弃已爬取数据")
+                return {}, []  # 丢弃已爬取数据，返回空结果
+            
             print(f"--- 进度 [{i}/{total}] : {cn_name} ---")
 
             # 定期重启浏览器释放内存（间隔从 15 提升到 30）
@@ -298,7 +334,16 @@ def crawl_champions(target_list, early_stop_func=None):
             is_first = (i == 1)
 
             for attempt in range(1, MAX_RETRIES + 1):
-                data, status = scrape_single_champion(driver, cn_name, en_name, is_first_page=is_first)
+                # 🛑 每次重试前检查停止信号
+                if stop_event and stop_event.is_set():
+                    print("   > ⚠️ 用户停止更新，丢弃已爬取数据")
+                    return {}, []  # 丢弃已爬取数据，返回空结果
+                
+                data, status = scrape_single_champion(
+                    driver, cn_name, en_name, 
+                    is_first_page=is_first, 
+                    stop_event=stop_event  # 传递停止事件
+                )
                 is_first = False  # 弹窗只需第一次处理
 
                 if status == "clean" and data:

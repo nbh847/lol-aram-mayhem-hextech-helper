@@ -16,7 +16,7 @@ import traceback
 
 # ============ 路径初始化 (兼容 PyInstaller 打包) ============
 
-from scripts.config import get_base_dir, BASE_DIR
+from scripts.config import get_base_dir, BASE_DIR, get_full_update_status
 os.chdir(BASE_DIR)
 sys.path.insert(0, BASE_DIR)
 
@@ -346,8 +346,8 @@ class UpdateDialog:
         y = app.root.winfo_y() + (app.root.winfo_height() - min_h) // 2
         
         self.dlg.geometry(f"{w}x{min_h}+{x}+{y}")
-        # 在设定好绝对尺寸后再禁用缩放，防止 Windows 过早锁死窗口尺寸导致元素被截住
-        self.dlg.resizable(False, False)
+        # 允许垂直缩放，便于展开高级选项
+        self.dlg.resizable(False, True)
 
     def _build_ui(self):
         main = tk.Frame(self.dlg, bg=self.BG, padx=24, pady=20)
@@ -357,51 +357,53 @@ class UpdateDialog:
         tk.Label(main, text="选择更新方式", font=("Microsoft YaHei", 16, "bold"),
                  fg=self.TEXT, bg=self.BG).pack(anchor="w", pady=(0, 4))
 
-        # ---- 爬虫选项区 ----
-        tk.Label(main, text="🌐 本地爬虫更新 (需要 Chrome 浏览器)",
+        # ---- 一键更新 (普通用户) ----
+        self._option_row(main,
+            icon="🚀", title="一键更新", tag="推荐",
+            desc="从在线获取最新数据，优先下载，失败自动爬虫",
+            command=lambda: self._select('one_click'))
+
+        # ---- 高级选项 (数据维护者) ----
+        advanced_frame = tk.Frame(main, bg=self.BG)
+        advanced_frame.pack(fill=tk.X, pady=(6, 0))
+
+        self.advanced_visible = False
+        self.advanced_content = tk.Frame(advanced_frame, bg=self.BG)
+
+        # 展开按钮
+        expand_btn = tk.Label(advanced_frame, text="▶ 高级选项", font=("Microsoft YaHei", 9),
+                              fg=self.TEXT_DIM, bg=self.BG, cursor="hand2")
+        expand_btn.pack(anchor="w")
+        expand_btn.bind("<Button-1>", self._toggle_advanced)
+
+        # 高级选项内容（初始隐藏）
+        tk.Label(self.advanced_content, text="🛠 数据维护者选项 (需要 Chrome 浏览器)",
                  font=("Microsoft YaHei", 9), fg=self.WARNING,
                  bg=self.BG).pack(anchor="w", pady=(8, 6))
 
-        self._option_row(main,
-            icon="🔍", title="抽样校验", tag="推荐",
-            desc="随机3英雄比对，有差异自动全量更新",
-            command=lambda: self._select('spot_check'))
-
-        self._option_row(main,
-            icon="🧠", title="智能增量", tag=None,
-            desc="自动爬取新英雄 + 改名英雄 + 缺失英雄",
+        self._option_row(self.advanced_content,
+            icon="🧠", title="智能增量更新", tag="维护用",
+            desc="只爬取新英雄、改名英雄和缺失数据，避免重复爬取",
             command=lambda: self._select('smart'))
 
-        self._option_row(main,
-            icon="🔄", title="全量更新", tag=None,
-            desc="强制重爬所有英雄，耗时较长",
+        # 全量更新：带倒计时提醒
+        full_update_status = get_full_update_status()
+        full_update_desc = "重新爬取所有英雄数据，耗时较长但数据最新"
+        if full_update_status['overdue']:
+            full_update_desc += f"\n⚠️ {full_update_status['message']}"
+        else:
+            full_update_desc += f"\n📅 {full_update_status['message']}，{full_update_status['days_remaining']}天后需更新"
+        
+        self._option_row(self.advanced_content,
+            icon="🔄", title="全量更新", tag="定期维护",
+            desc=full_update_desc,
             command=lambda: self._select('full'))
-
-        self._option_row(main,
-            icon="🎯", title="精确更新", tag=None,
-            desc="手动指定英雄名称进行更新",
-            command=self._precise_input)
-
-        # ---- 分隔线 ----
-        sep_frame = tk.Frame(main, bg=self.BG, pady=8)
-        sep_frame.pack(fill=tk.X)
-        tk.Frame(sep_frame, bg=self.BORDER, height=1).pack(fill=tk.X)
-
-        # ---- GitHub 下载 ----
-        tk.Label(main, text="📦 在线下载 (无需浏览器)",
-                 font=("Microsoft YaHei", 9), fg=self.TEXT_DIM,
-                 bg=self.BG).pack(anchor="w", pady=(0, 6))
-
-        self._option_row(main,
-            icon="📥", title="GitHub 下载", tag=None,
-            desc="从仓库下载预处理数据 (取决于仓库更新时间)",
-            command=lambda: self._select('github'))
 
         # ---- 底部: 帮助按钮 ----
         bottom = tk.Frame(main, bg=self.BG)
         bottom.pack(fill=tk.X, pady=(8, 0))
 
-        help_btn = tk.Label(bottom, text=" ？", font=("Microsoft YaHei", 12, "bold"),
+        help_btn = tk.Label(bottom, text=" ?", font=("Microsoft YaHei", 12, "bold"),
                             fg=self.TEXT_DIM, bg=self.BG, cursor="hand2",
                             width=3, relief=tk.FLAT,
                             highlightbackground=self.BORDER, highlightthickness=1)
@@ -409,6 +411,25 @@ class UpdateDialog:
         help_btn.bind("<Enter>", lambda e: help_btn.config(fg=self.ACCENT))
         help_btn.bind("<Leave>", lambda e: help_btn.config(fg=self.TEXT_DIM))
         help_btn.bind("<Button-1>", lambda e: self._show_help())
+    
+    def _toggle_advanced(self, event=None):
+        """切换高级选项的显示/隐藏"""
+        if self.advanced_visible:
+            # 收起
+            self.advanced_content.pack_forget()
+            event.widget.config(text="▶ 高级选项")
+            self.advanced_visible = False
+        else:
+            # 展开
+            self.advanced_content.pack(fill=tk.X, pady=(0, 0))
+            event.widget.config(text="▼ 收起选项")
+            self.advanced_visible = True
+
+        # 重新调整窗口大小以适应内容
+        self.dlg.update_idletasks()
+        current_w = self.dlg.winfo_width()
+        new_h = self.dlg.winfo_reqheight()
+        self.dlg.geometry(f"{current_w}x{new_h}")
 
     def _option_row(self, parent, icon, title, tag, desc, command):
         """创建一个可点击的选项行"""
@@ -433,9 +454,9 @@ class UpdateDialog:
             tk.Label(tag_frame, text=tag, font=("Microsoft YaHei", 8),
                      fg="white", bg=self.ACCENT).pack()
 
-        # 描述
+        # 描述（支持多行显示）
         tk.Label(inner, text=desc, font=("Microsoft YaHei", 9),
-                 fg=self.TEXT_DIM, bg=self.BG_CARD, anchor="w").pack(fill=tk.X, pady=(2, 0))
+                 fg=self.TEXT_DIM, bg=self.BG_CARD, anchor="w", justify=tk.LEFT).pack(fill=tk.X, pady=(2, 0))
 
         # 绑定点击事件到所有子组件
         def _on_enter(e):
@@ -452,6 +473,23 @@ class UpdateDialog:
 
     def _select(self, mode):
         """选择更新模式并关闭对话框"""
+        # 全量更新冷却确认: 距上次全量不足24h时, 弹窗让用户确认是否强制
+        if mode == 'full':
+            from datetime import datetime
+            full_status = get_full_update_status()
+            last_full = full_status.get('last_update')
+            if last_full:
+                hours_since = (datetime.now() - last_full).total_seconds() / 3600
+                if hours_since < 24:
+                    confirm = messagebox.askyesno(
+                        "全量更新确认",
+                        f"📅 {hours_since:.1f} 小时前刚执行过全量更新 (< 24h)。\n\n"
+                        f"数据很可能已经是最新, 全量更新需要 10-20 分钟。\n\n"
+                        f"是否仍要强制全量更新?",
+                        parent=self.dlg,
+                    )
+                    if not confirm:
+                        return  # 用户取消, 不关闭对话框, 不触发更新
         self.dlg.destroy()
         self.app._run_update(mode)
 
@@ -496,26 +534,26 @@ class UpdateDialog:
         """显示帮助信息"""
         help_text = (
             "📖 更新方式说明\n\n"
-            "━━ 本地爬虫 (需要 Chrome) ━━\n\n"
-            "🔍 抽样校验 [推荐]\n"
-            "  从所有英雄中随机选取3个，爬取最新数据与本地\n"
-            "  比对。如果发现差异，自动触发全量更新。\n"
-            "  适合游戏版本更新后快速检测数据是否过期。\n\n"
-            "🧠 智能增量\n"
-            "  自动检测并爬取: 新出的英雄、近期改名的英雄、\n"
-            "  以及本地缺失数据的英雄。不会重复爬取已有数据。\n\n"
+            "━━ 普通用户 ━━\n\n"
+            "🚀 一键更新 [强烈推荐]\n"
+            "  自动获取最新数据，无需任何选择。\n"
+            "  • 优先从在线下载（快速稳定，1分钟内完成）\n"
+            "  • 若在线失败自动切换本地爬虫（需要Chrome浏览器）\n"
+            "  • 更新过程中可随时点「停止更新」终止\n\n"
+            "━━ 数据维护者 ━━\n\n"
+            "🧠 智能增量更新\n"
+            "  只爬取新英雄、改名英雄和缺失数据，避免重复爬取。\n"
+            "  适合更新GitHub数据源时使用，节省时间。\n"
+            "  • 自动跳过已有且最新的数据\n"
+            "  • 只爬取新增、改名或缺失的英雄\n"
+            "  • 需要Chrome浏览器和网络环境\n\n"
             "🔄 全量更新\n"
-            "  强制重新爬取全部英雄的海克斯数据。\n"
-            "  耗时较长 (约10-20分钟)，适合数据严重过期时使用。\n\n"
-            "🎯 精确更新\n"
-            "  手动输入英雄名称 (支持中文名/英文名)，\n"
-            "  仅更新指定英雄的数据。\n\n"
-            "━━ 在线下载 (无需 Chrome) ━━\n\n"
-            "📥 GitHub 下载\n"
-            "  从项目仓库直接下载预处理好的数据文件。\n"
-            "  ⚠ 注意: 仓库数据由开发者手动更新推送，\n"
-            "  时效性不一定能保证。如果需要最新数据，\n"
-            "  建议优先使用爬虫方式。"
+            "  重新爬取所有英雄的数据，确保数据最新。\n"
+            "  耗时较长（约10-15分钟），适合定期维护。\n"
+            "  • 覆盖所有英雄的最新数据\n"
+            "  • 修复过时或错误的数据\n"
+            "  • 建议每1-2周执行一次\n"
+            "  • 需要Chrome浏览器和网络环境"
         )
         messagebox.showinfo("更新方式说明", help_text, parent=self.dlg)
 
@@ -572,6 +610,10 @@ class LauncherApp:
         self.analyzer = None
         self.lcu = None
         self.tray = TrayManager(self)
+        
+        # 更新控制变量
+        self.update_stop_event = None  # threading.Event，更新线程用
+        self.update_thread = None      # 保存更新线程引用
 
         # 通信队列
         self.overlay_queue = queue.Queue()
@@ -914,27 +956,54 @@ class LauncherApp:
     def _run_update(self, mode, hero_names=None):
         """执行更新操作 (后台线程)"""
         self.update_btn.config(state=tk.DISABLED)
+        
+        # 创建停止事件并保存线程引用
+        self.update_stop_event = threading.Event()
+        self.update_thread = threading.current_thread()
+        
+        # 显示停止按钮，隐藏更新按钮
+        self.update_btn.pack_forget()
+        self.stop_btn.config(text="⏸ 停止更新", command=self._stop_update, state=tk.NORMAL)
+        self.stop_btn.pack(fill=tk.X, pady=(0, 8))
 
         mode_labels = {
-            'spot_check': '🔍 抽样校验',
-            'smart':      '🧠 智能增量',
-            'full':       '🔄 全量更新',
-            'precise':    '🎯 精确更新',
-            'github':     '📥 GitHub 下载',
+            'one_click':   '🚀 一键更新',
+            'spot_check':  '🔍 抽样校验',
+            'smart':       '🧠 智能增量',
+            'full':        '🔄 全量更新',
+            'precise':     '🎯 精确更新',
+            'github':      '📥 在线下载',
         }
         self._log(f"{mode_labels.get(mode, mode)} 开始...")
 
         def _run():
             try:
-                if mode == 'github':
+                if mode == 'one_click':
+                    from scripts.updater import one_click_update
+                    success = one_click_update(
+                        log_func=self._log_safe, 
+                        stop_event=self.update_stop_event
+                    )
+                elif mode == 'github':
                     from scripts.updater import download_from_github
-                    success = download_from_github(log_func=self._log_safe)
+                    success = download_from_github(
+                        log_func=self._log_safe, 
+                        stop_event=self.update_stop_event
+                    )
                 elif mode == 'precise' and hero_names:
                     from scripts.updater import update_specific_heroes
-                    success = update_specific_heroes(hero_names, log_func=self._log_safe)
+                    success = update_specific_heroes(
+                        hero_names, 
+                        log_func=self._log_safe,
+                        stop_event=self.update_stop_event
+                    )
                 else:
                     from scripts.updater import run_update
-                    success = run_update(mode=mode, log_func=self._log_safe)
+                    success = run_update(
+                        mode=mode, 
+                        log_func=self._log_safe,
+                        stop_event=self.update_stop_event
+                    )
 
                 if success:
                     self._log("✅ 更新完成!")
@@ -948,6 +1017,14 @@ class LauncherApp:
                 self.gui_queue.put({"event": "update_done"})
 
         threading.Thread(target=_run, daemon=True).start()
+    
+    def _stop_update(self):
+        """停止数据更新"""
+        if self.update_stop_event:
+            self.update_stop_event.set()  # 设置停止标志
+            self._log("⚠️ 正在停止更新...")
+            # 禁用停止按钮防止重复点击
+            self.stop_btn.config(state=tk.DISABLED)
 
     # ==========================================
     # 系统托盘
@@ -1054,7 +1131,17 @@ class LauncherApp:
             self._quit_app()
 
         elif event == "update_done":
-            self.update_btn.config(state=tk.NORMAL)
+            # 恢复UI状态
+            if hasattr(self, 'stop_btn') and hasattr(self, 'update_btn'):
+                self.stop_btn.pack_forget()
+                self.update_btn.pack(fill=tk.X, pady=(0, 8))
+                self.update_btn.config(state=tk.NORMAL)
+                if hasattr(self, 'stop_btn'):
+                    self.stop_btn.config(state=tk.NORMAL)
+            
+            # 清除停止控制变量
+            self.update_stop_event = None
+            self.update_thread = None
 
         elif event == "reload_data":
             self._log("重新加载数据...")
