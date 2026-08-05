@@ -471,7 +471,6 @@ def one_click_update(log_func=None, stop_event=None):
         if download_from_github(log_func=_log, stop_event=stop_event):
             _log("✅ 在线下载成功，同步官方英雄数据...")
             # 下载成功后也要同步官方数据，确保英雄列表是最新的
-            from scripts.config import update_pinyin_file
             official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = sync_official_data()
             if official_en_to_cn:
                 update_pinyin_file(official_cn_to_en)
