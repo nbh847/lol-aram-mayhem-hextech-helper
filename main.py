@@ -21,49 +21,79 @@ from rapidocr_onnxruntime import RapidOCR
 
 # ================= 配置与常量 =================
 
-def get_regions():
-    """根据当前屏幕分辨率动态计算海克斯文字截取区域 (以 2K 2560x1440 为基准等比缩放)"""
-    with mss.mss() as sct:
-        mon = sct.monitors[1]  # 主显示器
-        W, H = mon['width'], mon['height']
+REFERENCE_WIDTH = 2560
+REFERENCE_HEIGHT = 1440
+REFERENCE_REGIONS = {
+    "hex_1": {'top': 540, 'left': 650,  'width': 320, 'height': 60},
+    "hex_2": {'top': 540, 'left': 1130, 'width': 320, 'height': 60},
+    "hex_3": {'top': 540, 'left': 1600, 'width': 320, 'height': 60},
+}
+REFERENCE_OVERLAY_TOP = 742
+REFERENCE_OVERLAY_HEIGHT = 166
+REFERENCE_TEXT_TOP = 506
+
+
+def get_ui_transform(width, height):
+    """返回参考画布到当前屏幕的统一缩放和居中偏移。"""
+    scale = min(width / REFERENCE_WIDTH, height / REFERENCE_HEIGHT)
+    offset_x = (width - REFERENCE_WIDTH * scale) / 2
+    offset_y = (height - REFERENCE_HEIGHT * scale) / 2
+    return scale, offset_x, offset_y
+
+
+def _scale_reference_region(region, scale, offset_x, offset_y):
     return {
-        "hex_1": {'top': int(H * 0.375),  'left': int(W * 0.2539), 'width': int(W * 0.125), 'height': int(H * 0.0417)},
-        "hex_2": {'top': int(H * 0.375),  'left': int(W * 0.4414), 'width': int(W * 0.125), 'height': int(H * 0.0417)},
-        "hex_3": {'top': int(H * 0.375),  'left': int(W * 0.625),  'width': int(W * 0.125), 'height': int(H * 0.0417)},
+        'top': int(round(offset_y + region['top'] * scale)),
+        'left': int(round(offset_x + region['left'] * scale)),
+        'width': int(round(region['width'] * scale)),
+        'height': int(round(region['height'] * scale)),
     }
+
+
+def calculate_regions(width, height):
+    """按 2560x1440 参考画布统一缩放并水平/垂直居中。"""
+    scale, offset_x, offset_y = get_ui_transform(width, height)
+    return {
+        key: _scale_reference_region(region, scale, offset_x, offset_y)
+        for key, region in REFERENCE_REGIONS.items()
+    }
+
+
+def get_regions():
+    """计算当前主屏幕上的海克斯文字截取区域。"""
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+    return calculate_regions(mon['width'], mon['height'])
 
 REGIONS = get_regions()
 
+def calculate_overlay_regions(width, height):
+    """
+    计算海克斯下方图片区域，与 OCR 区共用同一参考画布变换。
+    """
+    scale, offset_x, offset_y = get_ui_transform(width, height)
+    regions = calculate_regions(width, height)
+    return {
+        key: {
+            'left': region['left'],
+            'top': int(round(offset_y + REFERENCE_OVERLAY_TOP * scale)),
+            'width': region['width'],
+            'height': int(round(REFERENCE_OVERLAY_HEIGHT * scale)),
+        }
+        for key, region in regions.items()
+    }
+
+
+def calculate_text_top(width, height):
+    """计算推荐文字顶部，与 OCR/图片区共用同一参考画布变换。"""
+    scale, _, offset_y = get_ui_transform(width, height)
+    return int(round(offset_y + REFERENCE_TEXT_TOP * scale))
+
+
 def get_overlay_regions():
-    """
-    海克斯下方图片UI的显示区域。
-    基于 REGIONS(海克斯名字OCR区) + 游戏内固定偏移推算, 而非独立屏幕比例。
-    这样只要 OCR 区对齐, 下方图片自动对齐, 换分辨率也稳定。
-
-    偏移量(相对海克斯名字 top, 以屏幕高度比例表达):
-      - OFFSET_DOWN_RATIO: 游戏内「名字」到「下方空白区」的固定距离 ≈ H * 0.125
-      - IMG_HEIGHT_RATIO:  图片高度 ≈ H * 0.09
-    (数值为初步估算, 需在真实游戏实测后微调)
-    """
-    OFFSET_DOWN_RATIO = 0.125   # 名字top → 下方图片top 的偏移 (待游戏实测微调)
-    IMG_HEIGHT_RATIO = 0.09     # 图片高度
-
     with mss.mss() as sct:
         mon = sct.monitors[1]
-        W, H = mon['width'], mon['height']
-
-    img_h = int(H * IMG_HEIGHT_RATIO)
-    offset_down = int(H * OFFSET_DOWN_RATIO)
-    regions = get_regions()
-    overlay = {}
-    for key, r in regions.items():
-        overlay[key] = {
-            'left':   r['left'],            # X 与海克斯卡片对齐
-            'top':    r['top'] + offset_down,   # 基于OCR区top向下偏移
-            'width':  r['width'],           # 宽度复用海克斯卡片
-            'height': img_h,
-        }
-    return overlay
+    return calculate_overlay_regions(mon['width'], mon['height'])
 
 OVERLAY_REGIONS = get_overlay_regions()
 
@@ -424,7 +454,10 @@ class OverlayApp:
             self.root.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
 
     def _setup_labels(self):
-        font_style = ("Microsoft YaHei", 14, "bold")
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+        scale, _, _ = get_ui_transform(monitor['width'], monitor['height'])
+        font_style = ("Microsoft YaHei", max(9, int(round(14 * scale))), "bold")
         for key in REGIONS:
             lbl = tk.Label(self.root, text="", font=font_style, bg=COLORS["bg"], justify="left")
             self.labels[key] = lbl
@@ -433,7 +466,7 @@ class OverlayApp:
             self.image_labels[key] = img_lbl
 
     def _load_templates(self):
-        """从 assets/templates/ 加载 PNG 模板。缺失不报错, 后续降级为不显示图片。"""
+        """从 assets/templates/ 加载三种推荐状态模板。"""
         templates_dir = os.path.join(BASE_DIR, "assets", "templates")
         if not os.path.isdir(templates_dir):
             return
@@ -447,14 +480,15 @@ class OverlayApp:
                 print(f"模板加载失败 {name}: {e}")
 
     def _select_template(self, info):
-        """根据推荐信息选择模板名, 无匹配返回 None"""
+        """按推荐状态选择模板: 普通、最优或异常。"""
         if info.get("error"):
-            return None
-        tier = info.get("tier", "未知")
-        return f"tier_{tier}"
+            return "recommend_error"
+        if info.get("highlight"):
+            return "recommend_best"
+        return "recommend_normal"
 
     def _render_image_card(self, key, info):
-        """渲染下方图片UI: 选模板 → 贴文字 → 显示。模板缺失时静默跳过。"""
+        """渲染下方推荐状态图片。模板缺失时静默跳过。"""
         tpl_name = self._select_template(info)
         if not tpl_name or tpl_name not in self.templates:
             return  # 无模板, 不显示图片UI
@@ -463,38 +497,9 @@ class OverlayApp:
         region = OVERLAY_REGIONS[key]
 
         try:
-            # 复制模板 (避免污染缓存), 缩放到目标区域尺寸
+            # 复制模板 (避免污染缓存), 缩放到实机截图校准后的目标区域尺寸
             card = self.templates[tpl_name].copy()
             card = card.resize((region['width'], region['height']), Image.LANCZOS)
-
-            # 贴排名文字 (居中)
-            from PIL import ImageDraw, ImageFont
-            draw = ImageDraw.Draw(card)
-            try:
-                font = ImageFont.truetype("msyh.ttc", int(region['height'] * 0.35))
-            except Exception:
-                font = ImageFont.load_default()
-
-            text = info.get("text", "")
-            tier = info.get("tier", "")
-            t_rank = info.get("t_rank", "?")
-            overall_rank = info.get("overall_rank", "?")
-            display_text = f"{tier} No.{t_rank}\n总 No.{overall_rank}"
-
-            # 居中绘制
-            bbox = draw.textbbox((0, 0), display_text, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            x = (card.width - tw) // 2 - bbox[0]
-            y = (card.height - th) // 2 - bbox[1]
-
-            # 文字颜色: highlight=金色, error=红色, 否则白色
-            if info.get("highlight"):
-                fill = (255, 215, 0, 255)
-            elif info.get("error"):
-                fill = (255, 51, 51, 255)
-            else:
-                fill = (255, 255, 255, 255)
-            draw.multiline_text((x, y), display_text, font=font, fill=fill, align="center")
 
             photo = ImageTk.PhotoImage(card)
             self.image_photos[key] = photo  # 防 GC
@@ -543,13 +548,11 @@ class OverlayApp:
     def update_display(self, results):
         self.clear_display()
 
-        # 强制对齐 Y 轴 (文字位置: 海克斯图标和名字的中间)
-        base_y_abs = REGIONS['hex_1']['top']
-        # 文字位置: 海克斯图标和名字的中间 = 名字上方约 H*0.04 (待游戏实测微调)
-        import mss as _mss
-        with _mss.mss() as _sct:
-            _H = _sct.monitors[1]['height']
-        fixed_rel_y = base_y_abs - self.offset_y - int(_H * 0.04)
+        # 文字位置与 OCR/图片区共用参考画布变换，避免非 16:9 分辨率漂移。
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+        text_top_abs = calculate_text_top(monitor['width'], monitor['height'])
+        fixed_rel_y = text_top_abs - self.offset_y
 
         for key, info in results.items():
             if not info.get("text"): continue
@@ -565,8 +568,9 @@ class OverlayApp:
 
             lbl.config(text=info["text"], fg=fg)
 
-            r_left = REGIONS[key]['left'] - self.offset_x
-            lbl.place(x=r_left, y=fixed_rel_y, anchor="nw")
+            region = REGIONS[key]
+            text_center_x = region['left'] - self.offset_x + region['width'] // 2
+            lbl.place(x=text_center_x, y=fixed_rel_y, anchor="n")
             lbl.lift()
 
             # 渲染下方图片UI
