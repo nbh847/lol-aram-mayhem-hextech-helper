@@ -623,6 +623,7 @@ class LauncherApp:
 
         # 状态变量
         self.engine_running = False
+        self.engine_starting = False
         self.controller = None
         self.overlay = None
         self.overlay_window = None
@@ -634,6 +635,7 @@ class LauncherApp:
         # 更新控制变量
         self.update_stop_event = None  # threading.Event，更新线程用
         self.update_thread = None      # 保存更新线程引用
+        self.data_loading = False      # 数据加载线程是否正在运行
 
         # 通信队列
         self.overlay_queue = queue.Queue()
@@ -854,6 +856,9 @@ class LauncherApp:
 
     def _load_data(self):
         """后台加载数据"""
+        self.data_loading = True
+        self._set_start_button_state()
+
         def _load():
             try:
                 from main import DataManager
@@ -877,15 +882,27 @@ class LauncherApp:
 
     def _start_engine(self):
         """启动识别引擎"""
-        if self.engine_running:
+        if self.engine_running or self.engine_starting:
+            return
+        if self.update_stop_event is not None:
+            messagebox.showinfo(
+                "数据更新中",
+                "数据更新正在进行，请等待更新完成后再开始识别。",
+                parent=self.root,
+            )
+            return
+        if self.data_loading:
+            messagebox.showwarning("提示", "数据正在加载，请稍候")
             return
         if not self.dm or not self.dm.hero_data:
             messagebox.showwarning("提示", "数据尚未加载完成，请稍候")
             return
 
+        self.engine_starting = True
         self.start_btn.pack_forget()
-        self.stop_btn.pack(fill=tk.X, pady=(0, 8), before=self.update_btn)
+        self._pack_engine_button(self.stop_btn)
         self.start_btn.config(state=tk.DISABLED)
+        self.update_btn.config(state=tk.NORMAL)
         self._set_status("启动中...", self.WARNING)
         self._log("正在初始化 OCR 引擎...")
 
@@ -929,6 +946,7 @@ class LauncherApp:
             )
             self.controller.start()
 
+            self.engine_starting = False
             self.engine_running = True
             self._set_status("运行中", self.SUCCESS)
             self._log("✅ 引擎已启动! F6=分析 | F7=识别 | F8=重置")
@@ -942,22 +960,25 @@ class LauncherApp:
             traceback.print_exc()
             self._engine_cleanup()
             self.stop_btn.pack_forget()
-            self.start_btn.pack(fill=tk.X, pady=(0, 8), before=self.update_btn)
-            self.start_btn.config(state=tk.NORMAL)
+            self._pack_engine_button(self.start_btn)
+            self._set_start_button_state()
+            self.update_btn.config(state=tk.NORMAL)
 
     def _stop_engine(self):
         """停止识别引擎"""
         self._log("正在停止引擎...")
         self._engine_cleanup()
         self.stop_btn.pack_forget()
-        self.start_btn.pack(fill=tk.X, pady=(0, 8), before=self.update_btn)
-        self.start_btn.config(state=tk.NORMAL)
+        self._pack_engine_button(self.start_btn)
+        self._set_start_button_state()
+        self.update_btn.config(state=tk.NORMAL)
         self._set_status("已停止", self.TEXT_DIM)
         self.hero_var.set("—")
         self._log("引擎已停止")
 
     def _engine_cleanup(self):
         """清理引擎资源"""
+        self.engine_starting = False
         self.engine_running = False
         if self.controller:
             self.controller.stop()
@@ -977,15 +998,34 @@ class LauncherApp:
 
     def _show_update_dialog(self):
         """显示更新选项对话框"""
+        if self.engine_running or self.engine_starting:
+            phase = "正在启动" if self.engine_starting else "正在运行"
+            messagebox.showinfo(
+                "暂不可更新",
+                f"识别引擎{phase}中，请先停止识别后再更新数据。",
+                parent=self.root,
+            )
+            return
+        if self.update_stop_event is not None:
+            messagebox.showinfo(
+                "数据更新中",
+                "数据更新正在进行，请等待当前更新完成。",
+                parent=self.root,
+            )
+            return
         UpdateDialog(self)
 
     def _run_update(self, mode, hero_names=None):
         """执行更新操作 (后台线程)"""
+        if self.engine_running or self.engine_starting:
+            self._log("⚠️ 识别引擎运行中，不能同时更新数据")
+            return
         self.update_btn.config(state=tk.DISABLED)
         
         # 创建停止事件并保存线程引用
         self.update_stop_event = threading.Event()
         self.update_thread = threading.current_thread()
+        self._set_start_button_state()
         
         # 显示更新停止按钮，隐藏更新按钮；不要复用识别引擎的停止按钮
         self.update_btn.pack_forget()
@@ -1054,6 +1094,22 @@ class LauncherApp:
             # 禁用停止按钮防止重复点击
             self.update_stop_btn.config(state=tk.DISABLED)
 
+    def _pack_engine_button(self, button):
+        """在数据更新按钮隐藏时，也按固定位置显示识别按钮。"""
+        for anchor in (self.update_btn, self.update_stop_btn, self.tray_btn):
+            if anchor.winfo_manager() == "pack":
+                button.pack(fill=tk.X, pady=(0, 8), before=anchor)
+                return
+        button.pack(fill=tk.X, pady=(0, 8))
+
+    def _set_start_button_state(self):
+        """根据数据、更新和引擎状态控制开始按钮。"""
+        ready = (
+            not self.engine_running
+            and not self.engine_starting
+        )
+        self.start_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+
     # ==========================================
     # 系统托盘
     # ==========================================
@@ -1112,10 +1168,12 @@ class LauncherApp:
         event = msg.get("event", "")
 
         if event == "data_loaded":
-            self.start_btn.config(state=tk.NORMAL)
+            self.data_loading = False
+            self._set_start_button_state()
 
         elif event == "data_error":
-            self.start_btn.config(state=tk.DISABLED)
+            self.data_loading = False
+            self._set_start_button_state()
 
         elif event == "create_overlay":
             self._create_overlay_and_start()
@@ -1169,6 +1227,7 @@ class LauncherApp:
             # 清除停止控制变量
             self.update_stop_event = None
             self.update_thread = None
+            self._set_start_button_state()
 
         elif event == "reload_data":
             self._log("重新加载数据...")
