@@ -7,6 +7,7 @@ import requests
 import sys
 import re
 import random
+import tempfile
 from datetime import datetime
 from pypinyin import lazy_pinyin
 
@@ -212,7 +213,7 @@ def compare_hero_data(history_rows, crawled_items):
     
     return local_set != remote_set
 
-def spot_check_and_update(official_en_to_cn, history_data, sample_size=3):
+def spot_check_and_update(official_en_to_cn, history_data, sample_size=3, stop_event=None):
     """随机抽取英雄进行抽样比对，一旦发现有差异立即触发全量更新"""
     all_en_names = list(official_en_to_cn.keys())
     # 优先从有历史数据的英雄中抽样，这样比对才有意义
@@ -247,7 +248,11 @@ def spot_check_and_update(official_en_to_cn, history_data, sample_size=3):
             print(f"    ✅ [{cn_name}] 数据一致")
             return False
 
-    sample_data, failed = crawler.crawl_champions(sample_list, early_stop_func=check_diff_callback)
+    sample_data, failed = crawler.crawl_champions(
+        sample_list,
+        early_stop_func=check_diff_callback,
+        stop_event=stop_event,
+    )
     
     if failed:
         print(f"\n⚠️ 抽样爬取失败的英雄: {failed}，跳过失败英雄继续比对。")
@@ -315,6 +320,10 @@ def run_update(mode='smart', log_func=None, official_data=None, stop_event=None)
     _log = log_func or print
 
     try:
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止更新，丢弃已下载数据")
+            return False
+
         # 1. 同步官方数据 (或使用已有数据)
         if official_data:
             official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = official_data
@@ -327,6 +336,10 @@ def run_update(mode='smart', log_func=None, official_data=None, stop_event=None)
             _log(f"✅ 同步完成: {len(official_en_to_cn)} 个英雄")
             update_pinyin_file(official_cn_to_en)
             _log("✅ 拼音文件已更新")
+
+        if stop_event and stop_event.is_set():
+            _log("⚠️ 用户停止更新，丢弃已下载数据")
+            return False
 
         # 2. 加载历史数据
         history_data = load_csv_history()
@@ -341,7 +354,14 @@ def run_update(mode='smart', log_func=None, official_data=None, stop_event=None)
 
         elif mode == 'spot_check':
             _log("模式: 抽样校验")
-            has_diff, sample_data = spot_check_and_update(official_en_to_cn, history_data)
+            has_diff, sample_data = spot_check_and_update(
+                official_en_to_cn,
+                history_data,
+                stop_event=stop_event,
+            )
+            if stop_event and stop_event.is_set():
+                _log("⚠️ 用户停止更新，丢弃已爬取数据")
+                return False
             if has_diff:
                 # 抽样差异可能是网络波动导致的误判, 若距上次全量不足冷却时间则跳过
                 full_status = get_full_update_status()
@@ -425,30 +445,62 @@ def download_from_github(log_func=None, stop_event=None):
 
     success_count = 0
     total = len(files_to_download)
+    temp_files = []
 
-    for idx, (remote_path, local_path, desc) in enumerate(files_to_download, 1):
-        # 🛑 每个文件下载前检查停止信号
+    try:
+        for idx, (remote_path, local_path, desc) in enumerate(files_to_download, 1):
+            # 🛑 每个文件下载前检查停止信号
+            if stop_event and stop_event.is_set():
+                _log("⚠️ 用户停止下载，丢弃已下载文件")
+                return False
+
+            url = f"{GITHUB_RAW_BASE}/{remote_path}"
+            _log(f"下载中 [{idx}/{total}]: {desc}...")
+            try:
+                resp = requests.get(url, timeout=30)
+                if stop_event and stop_event.is_set():
+                    _log("⚠️ 用户停止下载，丢弃已下载文件")
+                    return False
+
+                if resp.status_code == 200:
+                    directory = os.path.dirname(local_path) or "."
+                    os.makedirs(directory, exist_ok=True)
+                    fd, temp_path = tempfile.mkstemp(
+                        dir=directory,
+                        prefix=f".{os.path.basename(local_path)}.",
+                        suffix=".download",
+                    )
+                    temp_files.append((temp_path, local_path))
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(resp.content)
+                    _log(f"✅ {desc} 下载成功 ({len(resp.content)} bytes)")
+                    success_count += 1
+                else:
+                    _log(f"❌ {desc} 下载失败 (HTTP {resp.status_code})")
+            except Exception as e:
+                _log(f"❌ {desc} 下载异常: {e}")
+
         if stop_event and stop_event.is_set():
             _log("⚠️ 用户停止下载，丢弃已下载文件")
             return False
+        if success_count != total:
+            _log(f"下载完成: {success_count}/{total} 成功")
+            return False
 
-        url = f"{GITHUB_RAW_BASE}/{remote_path}"
-        _log(f"下载中 [{idx}/{total}]: {desc}...")
-        try:
-            resp = requests.get(url, timeout=30)
-            if resp.status_code == 200:
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                with open(local_path, 'wb') as f:
-                    f.write(resp.content)
-                _log(f"✅ {desc} 下载成功 ({len(resp.content)} bytes)")
-                success_count += 1
-            else:
-                _log(f"❌ {desc} 下载失败 (HTTP {resp.status_code})")
-        except Exception as e:
-            _log(f"❌ {desc} 下载异常: {e}")
+        # 三个文件全部成功后才替换正式数据，避免留下半套数据。
+        for temp_path, local_path in temp_files:
+            os.replace(temp_path, local_path)
 
-    _log(f"下载完成: {success_count}/{total} 成功")
-    return success_count == total
+        _log(f"下载完成: {success_count}/{total} 成功")
+        return True
+    finally:
+        for temp_path, _ in temp_files:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
 
 def one_click_update(log_func=None, stop_event=None):
@@ -465,26 +517,44 @@ def one_click_update(log_func=None, stop_event=None):
     """
     _log = log_func or print
 
+    def _stopped():
+        return stop_event is not None and stop_event.is_set()
+
     # Step 1: GitHub 在线下载
     _log("🌐 [1/2] 尝试在线下载最新数据...")
     try:
         if download_from_github(log_func=_log, stop_event=stop_event):
+            if _stopped():
+                _log("⏹ 用户停止更新，不进入本地兜底")
+                return False
             _log("✅ 在线下载成功，同步官方英雄数据...")
             # 下载成功后也要同步官方数据，确保英雄列表是最新的
             official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = sync_official_data()
             if official_en_to_cn:
                 update_pinyin_file(official_cn_to_en)
+                if _stopped():
+                    _log("⏹ 用户停止更新，丢弃本次更新")
+                    return False
                 _log(f"✅ 官方数据同步完成: {len(official_en_to_cn)} 个英雄")
                 if new_champs:
                     _log(f"🌟 发现 {len(new_champs)} 个新英雄，建议执行'智能增量更新'获取海克斯数据")
                 if renamed_champs:
                     _log(f"✏️ 发现 {len(renamed_champs)} 个改名英雄")
             return True
+        if _stopped():
+            _log("⏹ 用户停止更新，不进入本地兜底")
+            return False
         _log("⚠ 在线下载未完全成功，尝试本地爬取...")
     except Exception as e:
+        if _stopped():
+            _log("⏹ 用户停止更新，不进入本地兜底")
+            return False
         _log(f"⚠ 在线下载失败: {e}，尝试本地爬取...")
 
     # Step 2: 本地抽样校验（内部会自动判断是否需要全量）
+    if _stopped():
+        _log("⏹ 用户停止更新，不进入本地兜底")
+        return False
     _log("🔍 [2/2] 尝试本地抽样校验...")
     try:
         return run_update(mode='spot_check', log_func=_log, stop_event=stop_event)
