@@ -811,6 +811,12 @@ class LauncherApp:
                                     style='Danger.TButton', command=self._stop_engine)
         # 停止按钮初始隐藏
 
+        self.update_stop_btn = ttk.Button(
+            btn_frame, text="⏸  停止更新",
+            style='Danger.TButton', command=self._stop_update
+        )
+        # 更新停止按钮初始隐藏
+
         # 数据更新按钮
         self.update_btn = ttk.Button(btn_frame, text="📦  数据更新",
                                      style='Secondary.TButton',
@@ -878,7 +884,7 @@ class LauncherApp:
             return
 
         self.start_btn.pack_forget()
-        self.stop_btn.pack(fill=tk.X, pady=(0, 8))
+        self.stop_btn.pack(fill=tk.X, pady=(0, 8), before=self.update_btn)
         self.start_btn.config(state=tk.DISABLED)
         self._set_status("启动中...", self.WARNING)
         self._log("正在初始化 OCR 引擎...")
@@ -936,7 +942,7 @@ class LauncherApp:
             traceback.print_exc()
             self._engine_cleanup()
             self.stop_btn.pack_forget()
-            self.start_btn.pack(fill=tk.X, pady=(0, 8))
+            self.start_btn.pack(fill=tk.X, pady=(0, 8), before=self.update_btn)
             self.start_btn.config(state=tk.NORMAL)
 
     def _stop_engine(self):
@@ -944,7 +950,7 @@ class LauncherApp:
         self._log("正在停止引擎...")
         self._engine_cleanup()
         self.stop_btn.pack_forget()
-        self.start_btn.pack(fill=tk.X, pady=(0, 8))
+        self.start_btn.pack(fill=tk.X, pady=(0, 8), before=self.update_btn)
         self.start_btn.config(state=tk.NORMAL)
         self._set_status("已停止", self.TEXT_DIM)
         self.hero_var.set("—")
@@ -981,10 +987,10 @@ class LauncherApp:
         self.update_stop_event = threading.Event()
         self.update_thread = threading.current_thread()
         
-        # 显示停止按钮，隐藏更新按钮
+        # 显示更新停止按钮，隐藏更新按钮；不要复用识别引擎的停止按钮
         self.update_btn.pack_forget()
-        self.stop_btn.config(text="⏸ 停止更新", command=self._stop_update, state=tk.NORMAL)
-        self.stop_btn.pack(fill=tk.X, pady=(0, 8))
+        self.update_stop_btn.config(state=tk.NORMAL)
+        self.update_stop_btn.pack(fill=tk.X, pady=(0, 8), before=self.tray_btn)
 
         mode_labels = {
             'one_click':   '🚀 一键更新',
@@ -1046,7 +1052,7 @@ class LauncherApp:
             self.update_stop_event.set()  # 设置停止标志
             self._log("⚠️ 正在停止更新...")
             # 禁用停止按钮防止重复点击
-            self.stop_btn.config(state=tk.DISABLED)
+            self.update_stop_btn.config(state=tk.DISABLED)
 
     # ==========================================
     # 系统托盘
@@ -1154,12 +1160,11 @@ class LauncherApp:
 
         elif event == "update_done":
             # 恢复UI状态
-            if hasattr(self, 'stop_btn') and hasattr(self, 'update_btn'):
-                self.stop_btn.pack_forget()
-                self.update_btn.pack(fill=tk.X, pady=(0, 8))
+            if hasattr(self, 'update_stop_btn') and hasattr(self, 'update_btn'):
+                self.update_stop_btn.pack_forget()
+                self.update_btn.pack(fill=tk.X, pady=(0, 8), before=self.tray_btn)
                 self.update_btn.config(state=tk.NORMAL)
-                if hasattr(self, 'stop_btn'):
-                    self.stop_btn.config(state=tk.NORMAL)
+                self.update_stop_btn.config(state=tk.NORMAL)
             
             # 清除停止控制变量
             self.update_stop_event = None

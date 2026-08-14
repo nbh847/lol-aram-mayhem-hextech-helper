@@ -36,6 +36,8 @@
 - 已修复 PyInstaller 的 Tcl/Tk 打包缺陷：显式收集 `tkinter` 纯 Python 包、`_tkinter.pyd`、Tcl/Tk DLL 和脚本，并新增 `runtime_hooks/fix_tk.py` 指向包内运行时。
 - 已重新生成并实际启动验证最新正式包：`dist/build_1786703165/ARAMHelper`；普通用户模式下成功创建「ARAM 海克斯助手」主窗口，验证进程已正常关闭。
 - 已新增维护者数据入口：`update_data_and_push.cmd` 无参数执行全量更新、校验三个 `data/` 文件并推送到 `origin/main`；已同步写入 README 使用命令，真实全量抓取待首次执行验证。
+- 已修复识别启动按钮误显示「停止更新」且点击无效的问题：识别引擎和数据更新改用独立的停止按钮，并固定按钮重新显示时的 pack 顺序，保持「数据更新」和托盘按钮位置不变；源码通过 Python 3.12 AST 解析，Tk 控件顺序测试通过。
+- 已重新打包按钮修复版本：`dist/build_1786710681/ARAMHelper`，已检查 EXE、Tkinter 运行时、最新数据和资源文件均存在，待用户实际操作验证。
 
 ## 进行中
 
