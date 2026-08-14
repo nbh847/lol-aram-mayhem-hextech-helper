@@ -24,6 +24,7 @@ from main import DataManager, GameAnalyzer
 
 
 DEFAULT_SCREENSHOT = PROJECT_ROOT / "data" / "lol-hex-view.png"
+DEFAULT_HERO = "txj"
 
 
 def get_monitor():
@@ -132,12 +133,20 @@ def _draw_overlay_text(canvas, region, text, color, font):
     lines = text.splitlines() or [text]
     spacing = max(2, font.size // 5) if hasattr(font, "size") else 2
     line_sizes = [draw.textbbox((0, 0), line, font=font) for line in lines]
-    block_width = max((box[2] - box[0] for box in line_sizes), default=0)
     line_height = max((box[3] - box[1] for box in line_sizes), default=0)
-    x = region["left"] + (region["width"] - block_width) // 2
     y = region["top"]
     for index, line in enumerate(lines):
-        draw.text((x, y + index * (line_height + spacing)), line, fill=color, font=font)
+        box = line_sizes[index]
+        line_width = box[2] - box[0]
+        x = region["left"] + (region["width"] - line_width) // 2 - box[0]
+        draw.text(
+            (x, y + index * (line_height + spacing)),
+            line,
+            fill=color,
+            font=font,
+            stroke_width=1 if color == core.RECOMMENDATION_TEXT_COLORS["best"] else 0,
+            stroke_fill=(10, 22, 32, 255),
+        )
 
 
 def detect_source_transform(source, monitor):
@@ -190,7 +199,6 @@ def compose_overlay(source, results, monitor):
     """生成只含文字和推荐图片的透明覆盖层。"""
     matrix = detect_source_transform(source, monitor)
     canvas = Image.new("RGBA", (monitor["width"], monitor["height"]), (0, 0, 0, 0))
-    font = _load_preview_font(14)
     source_regions = get_source_regions(source.width, source.height)
     source_overlay_regions = get_display_overlay_regions(source.width, source.height)
     text_y = core.calculate_text_top(source.width, source.height)
@@ -202,35 +210,25 @@ def compose_overlay(source, results, monitor):
         if path.exists():
             templates[name] = Image.open(path).convert("RGBA")
 
-    color_map = {
-        "normal": (0, 255, 0, 255),
-        "best": (255, 215, 0, 255),
-        "error": (255, 51, 51, 255),
-    }
     for key, info in results.items():
         if not info.get("text"):
             continue
 
         region = _transform_region(source_regions[key], matrix)
-        if info.get("error"):
-            state = "error"
-            template_name = "recommend_error"
-        elif info.get("highlight"):
-            state = "best"
-            template_name = "recommend_best"
-        else:
-            state = "normal"
-            template_name = "recommend_normal"
+        state = core.get_recommendation_state(info)
+        template_name = f"recommend_{state}"
 
         image_region = _transform_region(source_overlay_regions[key], matrix)
         template = templates.get(template_name)
         if template is not None:
-            resized = template.resize(
+            decorated = core.decorate_recommendation_card(template, state)
+            resized = decorated.resize(
                 (image_region["width"], image_region["height"]),
                 Image.Resampling.LANCZOS,
             )
             canvas.alpha_composite(resized, (image_region["left"], image_region["top"]))
 
+        font = _load_preview_font(17 if state == "best" else 14)
         text_point = matrix @ np.array(
             [source_regions[key]["left"], text_y, 1.0]
         )
@@ -239,7 +237,13 @@ def compose_overlay(source, results, monitor):
             "top": int(round(text_point[1])),
             "width": region["width"],
         }
-        _draw_overlay_text(canvas, text_region, info["text"], color_map[state], font)
+        _draw_overlay_text(
+            canvas,
+            text_region,
+            core.get_recommendation_text(info),
+            core.RECOMMENDATION_TEXT_COLORS[state],
+            font,
+        )
 
     return canvas
 
@@ -247,8 +251,11 @@ def compose_overlay(source, results, monitor):
 class Win32OverlayPreview:
     """用 Win32 分层窗口把 RGBA 内容真正叠加到当前桌面。"""
 
+    WM_CLOSE = 0x0010
     WM_HOTKEY = 0x0312
     WM_DESTROY = 0x0002
+    CTRL_C_EVENT = 0
+    CTRL_BREAK_EVENT = 1
     VK_ESCAPE = 0x1B
     WS_POPUP = 0x80000000
     WS_EX_TOPMOST = 0x00000008
@@ -270,10 +277,21 @@ class Win32OverlayPreview:
         self.left = monitor["left"]
         self.top = monitor["top"]
         self.hwnd = None
+        self._console_handler = None
         self._class_name = f"LolHexTransparentOverlay_{id(self)}"
         self._wnd_proc = self._make_wnd_proc()
 
     def _make_wnd_proc(self):
+        user32 = ctypes.windll.user32
+        destroy_window = user32.DestroyWindow
+        destroy_window.argtypes = [wintypes.HWND]
+        destroy_window.restype = wintypes.BOOL
+        unregister_hot_key = user32.UnregisterHotKey
+        unregister_hot_key.argtypes = [wintypes.HWND, ctypes.c_int]
+        unregister_hot_key.restype = wintypes.BOOL
+        post_quit_message = user32.PostQuitMessage
+        post_quit_message.argtypes = [ctypes.c_int]
+        post_quit_message.restype = None
         callback_type = ctypes.WINFUNCTYPE(
             ctypes.c_ssize_t,
             wintypes.HWND,
@@ -281,22 +299,35 @@ class Win32OverlayPreview:
             wintypes.WPARAM,
             wintypes.LPARAM,
         )
+        def_window_proc = ctypes.windll.user32.DefWindowProcW
+        def_window_proc.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        def_window_proc.restype = ctypes.c_ssize_t
 
         def wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_CLOSE:
+                destroy_window(hwnd)
+                return 0
             if msg == self.WM_HOTKEY and wparam == 1:
-                ctypes.windll.user32.DestroyWindow(hwnd)
+                destroy_window(hwnd)
                 return 0
             if msg == self.WM_DESTROY:
-                ctypes.windll.user32.UnregisterHotKey(hwnd, 1)
-                ctypes.windll.user32.PostQuitMessage(0)
+                unregister_hot_key(hwnd, 1)
+                post_quit_message(0)
                 return 0
-            return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+            return def_window_proc(hwnd, msg, wparam, lparam)
 
         return callback_type(wnd_proc)
 
     def show(self):
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
         hinstance = kernel32.GetModuleHandleW(None)
 
         class BITMAPINFOHEADER(ctypes.Structure):
@@ -345,6 +376,90 @@ class Win32OverlayPreview:
                 ("lpszClassName", wintypes.LPCWSTR),
             ]
 
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.HMENU,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.GetDC.restype = wintypes.HDC
+        user32.UpdateLayeredWindow.argtypes = [
+            wintypes.HWND,
+            wintypes.HDC,
+            ctypes.POINTER(POINT),
+            ctypes.POINTER(SIZE),
+            wintypes.HDC,
+            ctypes.POINTER(POINT),
+            wintypes.DWORD,
+            ctypes.POINTER(BLENDFUNCTION),
+            wintypes.DWORD,
+        ]
+        user32.UpdateLayeredWindow.restype = wintypes.BOOL
+        user32.RegisterHotKey.argtypes = [
+            wintypes.HWND,
+            ctypes.c_int,
+            wintypes.UINT,
+            wintypes.UINT,
+        ]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG),
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.UINT,
+        ]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.ReleaseDC.restype = ctypes.c_int
+
+        gdi32 = ctypes.windll.gdi32
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateDIBSection.argtypes = [
+            wintypes.HDC,
+            ctypes.POINTER(BITMAPINFO),
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.HANDLE,
+            wintypes.DWORD,
+        ]
+        gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+        gdi32.SelectObject.argtypes = [wintypes.HDC, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        gdi32.DeleteDC.restype = wintypes.BOOL
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        kernel32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+        kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+
         wnd_class = WNDCLASSW(
             0,
             ctypes.cast(self._wnd_proc, ctypes.c_void_p),
@@ -359,7 +474,6 @@ class Win32OverlayPreview:
         )
         user32.RegisterClassW(ctypes.byref(wnd_class))
 
-        user32.CreateWindowExW.restype = wintypes.HWND
         self.hwnd = user32.CreateWindowExW(
             self.WS_EX_TOPMOST
             | self.WS_EX_TRANSPARENT
@@ -380,12 +494,6 @@ class Win32OverlayPreview:
         )
         if not self.hwnd:
             raise ctypes.WinError()
-
-        gdi32 = ctypes.windll.gdi32
-        user32.GetDC.restype = wintypes.HDC
-        gdi32.CreateCompatibleDC.restype = wintypes.HDC
-        gdi32.CreateDIBSection.restype = wintypes.HBITMAP
-        gdi32.SelectObject.restype = ctypes.c_void_p
 
         screen_dc = user32.GetDC(None)
         memory_dc = gdi32.CreateCompatibleDC(screen_dc)
@@ -448,12 +556,31 @@ class Win32OverlayPreview:
             print("警告：Esc 全局退出热键注册失败，请在终端按 Ctrl+C 退出")
         user32.ShowWindow(self.hwnd, self.SW_SHOWNOACTIVATE)
 
+        console_handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        def console_handler(control_type):
+            if control_type in (self.CTRL_C_EVENT, self.CTRL_BREAK_EVENT) and self.hwnd:
+                user32.PostMessageW(self.hwnd, self.WM_CLOSE, 0, 0)
+                return True
+            return False
+
+        self._console_handler = console_handler_type(console_handler)
+        if not kernel32.SetConsoleCtrlHandler(self._console_handler, True):
+            print("警告：Ctrl+C 处理器注册失败，请按 Esc 退出")
+            self._console_handler = None
+
         try:
             message = wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
         finally:
+            if self._console_handler is not None:
+                kernel32.SetConsoleCtrlHandler(self._console_handler, False)
+                self._console_handler = None
+            if self.hwnd and user32.IsWindow(self.hwnd):
+                user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
             gdi32.SelectObject(memory_dc, old_bitmap)
             gdi32.DeleteObject(bitmap)
             gdi32.DeleteDC(memory_dc)
@@ -478,7 +605,7 @@ def run_preview(screenshot_path, hero_query=None):
     for key, result in results.items():
         print(f"{key}: {result.get('text', '')}")
     preview = compose_overlay(source, results, monitor)
-    print("透明覆盖层已显示；当前桌面内容保持不变，按 Esc 退出。")
+    print("透明覆盖层已显示；当前桌面内容保持不变，按 Esc 或 Ctrl+C 退出。")
     try:
         Win32OverlayPreview(preview, monitor).show()
     finally:
@@ -497,7 +624,8 @@ def main():
     )
     parser.add_argument(
         "--hero",
-        help="可选：英雄中文名、拼音或简拼；指定后会使用本地数据进行真实匹配。",
+        default=DEFAULT_HERO,
+        help=f"英雄中文名、拼音或简拼，默认: {DEFAULT_HERO}（探险家）。",
     )
     args = parser.parse_args()
 

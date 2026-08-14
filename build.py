@@ -15,6 +15,34 @@ APP_NAME = "ARAMHelper"
 ENTRY_POINT = "gui_launcher.py"
 ICON_PATH = os.path.join("assets", "icon.ico")
 DIST_DIR = os.path.join("dist", APP_NAME)
+RUNTIME_HOOK_DIR = os.path.join("runtime_hooks", "fix_tk.py")
+
+
+def get_tk_runtime():
+    """返回当前 Python 安装中的 Tk 运行时文件。"""
+    base = sys.base_prefix
+    tcl_dir = os.path.join(base, "tcl", "tcl8.6")
+    tk_dir = os.path.join(base, "tcl", "tk8.6")
+    required = {
+        "_tkinter.pyd": os.path.join(base, "DLLs", "_tkinter.pyd"),
+        "tcl86t.dll": os.path.join(base, "DLLs", "tcl86t.dll"),
+        "tk86t.dll": os.path.join(base, "DLLs", "tk86t.dll"),
+        "tkinter": os.path.join(base, "Lib", "tkinter"),
+        "tcl8.6": tcl_dir,
+        "tk8.6": tk_dir,
+    }
+    missing = [name for name, path in required.items() if not os.path.exists(path)]
+    if missing:
+        print(f"❌ Tk 运行时文件缺失: {', '.join(missing)}")
+        return None
+    return {
+        "tcl_dir": tcl_dir,
+        "tk_dir": tk_dir,
+        "tkinter": required["_tkinter.pyd"],
+        "tkinter_package": required["tkinter"],
+        "tcl_dll": required["tcl86t.dll"],
+        "tk_dll": required["tk86t.dll"],
+    }
 
 
 def check_dependencies():
@@ -33,12 +61,18 @@ def check_dependencies():
     if not os.path.exists(ICON_PATH):
         print(f"⚠ 图标文件不存在: {ICON_PATH}，将使用默认图标")
 
+    if not get_tk_runtime():
+        return False
+
     return True
 
 
 def build():
     """执行 PyInstaller 打包"""
     global DIST_DIR
+    tk_runtime = get_tk_runtime()
+    if not tk_runtime:
+        return False
     print(f"\n{'='*50}")
     print(f"  打包 {APP_NAME}")
     print(f"  入口: {ENTRY_POINT}")
@@ -90,6 +124,16 @@ def build():
 
         # 运行时 hook: 修复 numpy 冻结环境检测
         "--runtime-hook", os.path.join("runtime_hooks", "fix_numpy.py"),
+        # 显式带入 Tk，避免开发机 Tcl_LIBRARY 指向不可用路径时被 PyInstaller 排除
+        "--runtime-hook", RUNTIME_HOOK_DIR,
+
+        # Tk 运行时（Tcl/Tk 脚本、DLL 和 _tkinter 扩展）
+        "--add-data", f"{tk_runtime['tcl_dir']};tcl/tcl8.6",
+        "--add-data", f"{tk_runtime['tk_dir']};tcl/tk8.6",
+        "--add-data", f"{tk_runtime['tkinter_package']};tkinter",
+        "--add-binary", f"{tk_runtime['tkinter']};.",
+        "--add-binary", f"{tk_runtime['tcl_dll']};.",
+        "--add-binary", f"{tk_runtime['tk_dll']};.",
 
         # 隐式导入
         "--hidden-import", "pystray._win32",

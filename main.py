@@ -9,7 +9,7 @@ import tkinter as tk
 import ctypes
 import msvcrt  # 用于清除输入缓冲区
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 import mss
 import keyboard
 from collections import defaultdict
@@ -29,8 +29,11 @@ REFERENCE_REGIONS = {
     "hex_3": {'top': 540, 'left': 1600, 'width': 320, 'height': 60},
 }
 REFERENCE_OVERLAY_TOP = 742
-REFERENCE_OVERLAY_HEIGHT = 166
+REFERENCE_OVERLAY_WIDTH = 248
+REFERENCE_OVERLAY_HEIGHT = 130
 REFERENCE_TEXT_TOP = 506
+RECOMMENDATION_TEMPLATE_SIZE = (1740, 904)
+RECOMMENDATION_CROP = (120, 50, 1620, 840)
 
 
 def get_ui_transform(width, height):
@@ -71,13 +74,14 @@ def calculate_overlay_regions(width, height):
     """
     计算海克斯下方图片区域，与 OCR 区共用同一参考画布变换。
     """
-    scale, offset_x, offset_y = get_ui_transform(width, height)
+    scale, _, offset_y = get_ui_transform(width, height)
     regions = calculate_regions(width, height)
+    overlay_width = int(round(REFERENCE_OVERLAY_WIDTH * scale))
     return {
         key: {
-            'left': region['left'],
+            'left': int(round(region['left'] + (region['width'] - overlay_width) / 2)),
             'top': int(round(offset_y + REFERENCE_OVERLAY_TOP * scale)),
-            'width': region['width'],
+            'width': overlay_width,
             'height': int(round(REFERENCE_OVERLAY_HEIGHT * scale)),
         }
         for key, region in regions.items()
@@ -98,12 +102,133 @@ def get_overlay_regions():
 OVERLAY_REGIONS = get_overlay_regions()
 
 COLORS = {
-    "normal": "#00FF00",  # 绿色
-    "best":   "#FFD700",  # 金色
+    "normal": "#38D15A",  # 低饱和绿色
+    "best":   "#FF6A2A",  # 高饱和橙色
     "status": "yellow",   # 黄色
     "error":  "#FF3333",  # 红色
     "bg":     "#000000"   # 背景黑
 }
+
+RECOMMENDATION_TEXT_COLORS = {
+    "normal": (56, 209, 90, 255),
+    "best": (255, 106, 42, 255),
+    "error": (255, 51, 51, 255),
+}
+
+
+def get_recommendation_state(info):
+    """返回推荐状态，供正式覆盖层和静态预览共用。"""
+    if info.get("error"):
+        return "error"
+    if info.get("highlight"):
+        return "best"
+    return "normal"
+
+
+def get_recommendation_text(info):
+    """为最优推荐增加明确的首选文字标识。"""
+    text = info.get("text", "")
+    if not info.get("highlight") or not text:
+        return text
+    lines = text.splitlines()
+    if lines:
+        lines[0] = f"★ 首选 · {lines[0].replace('【', '').replace('】', '')}"
+    return "\n".join(lines)
+
+
+def _load_recommendation_font(size):
+    """加载用于首选徽章的 Windows 中文粗体。"""
+    candidates = (
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                pass
+    return ImageFont.load_default()
+
+
+def decorate_recommendation_card(card, state):
+    """裁掉模板外围留白、统一圆角，并强化最优推荐。"""
+    card = card.convert("RGBA")
+    source_width, source_height = RECOMMENDATION_TEMPLATE_SIZE
+    crop_left, crop_top, crop_right, crop_bottom = RECOMMENDATION_CROP
+    width, height = card.size
+    card = card.crop(
+        (
+            int(round(crop_left * width / source_width)),
+            int(round(crop_top * height / source_height)),
+            int(round(crop_right * width / source_width)),
+            int(round(crop_bottom * height / source_height)),
+        )
+    )
+    width, height = card.size
+    corner_radius = max(20, int(min(width, height) * 0.12))
+    mask = Image.new("L", card.size, 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle(
+        (0, 0, width - 1, height - 1),
+        radius=corner_radius,
+        fill=255,
+    )
+    card.putalpha(mask)
+    if state != "best":
+        return card
+
+    accent = (255, 106, 42, 255)
+    highlight = (255, 235, 196, 255)
+    navy = (10, 22, 32, 255)
+    draw = ImageDraw.Draw(card)
+
+    banner_width = int(width * 0.52)
+    banner_height = int(height * 0.18)
+    banner_left = (width - banner_width) // 2
+    banner_top = max(12, int(height * 0.02))
+    banner_box = (
+        banner_left,
+        banner_top,
+        banner_left + banner_width,
+        banner_top + banner_height,
+    )
+    banner_glow = Image.new("RGBA", card.size, (0, 0, 0, 0))
+    banner_glow_draw = ImageDraw.Draw(banner_glow)
+    banner_glow_draw.rounded_rectangle(
+        banner_box,
+        radius=max(18, banner_height // 3),
+        outline=(255, 77, 22, 210),
+        width=max(12, width // 80),
+    )
+    banner_glow = banner_glow.filter(ImageFilter.GaussianBlur(max(8, width // 100)))
+    card = Image.alpha_composite(card, banner_glow)
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle(
+        banner_box,
+        radius=max(18, banner_height // 3),
+        fill=accent,
+        outline=highlight,
+        width=max(4, width // 250),
+    )
+    banner_font = _load_recommendation_font(max(46, int(height * 0.10)))
+    text = "首选推荐"
+    bbox = draw.textbbox((0, 0), text, font=banner_font, stroke_width=2)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    text_x = banner_left + (banner_width - text_width) // 2
+    text_y = banner_top + (banner_height - text_height) // 2 - bbox[1]
+    draw.text(
+        (text_x, text_y),
+        text,
+        font=banner_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=max(2, width // 250),
+        stroke_fill=navy,
+    )
+    card.putalpha(mask)
+    return card
 
 # ================= 1. 数据管理 (Model) =================
 
@@ -457,9 +582,10 @@ class OverlayApp:
         with mss.mss() as sct:
             monitor = sct.monitors[1]
         scale, _, _ = get_ui_transform(monitor['width'], monitor['height'])
-        font_style = ("Microsoft YaHei", max(9, int(round(14 * scale))), "bold")
+        self.font_style = ("Microsoft YaHei", max(9, int(round(14 * scale))), "bold")
+        self.best_font_style = ("Microsoft YaHei", max(10, int(round(17 * scale))), "bold")
         for key in REGIONS:
-            lbl = tk.Label(self.root, text="", font=font_style, bg=COLORS["bg"], justify="left")
+            lbl = tk.Label(self.root, text="", font=self.font_style, bg=COLORS["bg"], justify="center")
             self.labels[key] = lbl
             # 图片UI专用 Label
             img_lbl = tk.Label(self.root, bg=COLORS["bg"])
@@ -499,6 +625,7 @@ class OverlayApp:
         try:
             # 复制模板 (避免污染缓存), 缩放到实机截图校准后的目标区域尺寸
             card = self.templates[tpl_name].copy()
+            card = decorate_recommendation_card(card, get_recommendation_state(info))
             card = card.resize((region['width'], region['height']), Image.LANCZOS)
 
             photo = ImageTk.PhotoImage(card)
@@ -566,7 +693,11 @@ class OverlayApp:
             else:
                 fg = COLORS["normal"]
 
-            lbl.config(text=info["text"], fg=fg)
+            lbl.config(
+                text=get_recommendation_text(info),
+                fg=fg,
+                font=self.best_font_style if info["highlight"] else self.font_style,
+            )
 
             region = REGIONS[key]
             text_center_x = region['left'] - self.offset_x + region['width'] // 2
