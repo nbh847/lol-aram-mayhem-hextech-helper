@@ -35,6 +35,7 @@
 - 已将正式覆盖层布局统一为 `2560×1440` 参考画布 + 等比缩放 + 居中偏移；OCR 区、推荐文字、图片区域和字体共用同一缩放基准，避免不同宽高比分别按屏幕宽高缩放造成横向或纵向漂移。
 - 已修复 PyInstaller 的 Tcl/Tk 打包缺陷：显式收集 `tkinter` 纯 Python 包、`_tkinter.pyd`、Tcl/Tk DLL 和脚本，并新增 `runtime_hooks/fix_tk.py` 指向包内运行时。
 - 已重新生成并实际启动验证最新正式包：`dist/build_1786703165/ARAMHelper`；普通用户模式下成功创建「ARAM 海克斯助手」主窗口，验证进程已正常关闭。
+- 已新增维护者数据入口：`update_data_and_push.cmd` 无参数执行全量更新、校验三个 `data/` 文件并推送到 `origin/main`；已同步写入 README 使用命令，真实全量抓取待首次执行验证。
 
 ## 进行中
 

@@ -89,6 +89,16 @@
 
 *(注：如果你想要更新本程序的胜率数据库，只需在主界面点击“**数据更新**”。推荐直接使用“抽样校验”或者兜底的“Github下载”保持同频。)*
 
+### 维护者：定期更新并推送数据
+
+维护者在项目根目录执行下面这一条命令即可全量更新所有英雄数据，并将变更的 `data/` 文件提交推送到 `origin/main`：
+
+```powershell
+.\update_data_and_push.cmd
+```
+
+该入口不接收参数，默认执行全量爬取，通常需要 Google Chrome、网络环境和约 10–20 分钟。它只会提交 `data/hero_augments.csv`、`data/champions.json`、`data/pinyin_map.json`；如果爬取失败、远端仓库不匹配或暂存区已有改动，会停止推送。
+
 ---
 
 ### 版本二：本地源码部署版 (适合开发者/极客使用)
@@ -125,6 +135,8 @@
 * `scripts/lcu_connector.py`: 英雄联盟本地 API 通信模块。
 * `scripts/hero_scraper.py`: 爬虫脚本（基于 Selenium 抓取数据）。
 * `scripts/updater.py`: 数据同步工具（手动触发更新、合并数据）。
+* `scripts/maintain_data.py`: 维护者全量更新并推送数据入口。
+* `update_data_and_push.cmd`: Windows 无参数维护命令。
 * `data/hero_augments.csv`: 核心数据库。
 
 ## 📄 License
