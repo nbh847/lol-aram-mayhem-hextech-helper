@@ -213,5 +213,8 @@ config.json
 # 本地渲染预览截图 (仅 preview_overlay 测试用, 不提交)
 data/lol-hex-view.png
 
+# 引擎运行诊断日志 (main.log_engine_event 写入, 不提交)
+engine_debug.log
+
 # ZCode 工具内部目录
 .zcode/

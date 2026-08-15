@@ -37,7 +37,11 @@ RECOMMENDATION_CROP = (120, 50, 1620, 840)
 ANALYSIS_SIGNATURE_SIZE = (96, 18)
 ANALYSIS_CHANGE_THRESHOLD = 0.20
 ANALYSIS_CHANGED_REGION_COUNT = 2
-SELECTION_CONFIRMATION_POLLS = 2
+SELECTION_CONFIRMATION_POLLS = 3
+SELECTION_POLL_INTERVAL = 0.3
+# 海克斯界面关闭时暗色遮罩 lifted + 近黑卡片背景消失, 标题条带亮度大幅上升;
+# 卡片流光/hover 动画不会让卡片内部持续变亮, 因此用亮度增量而非画面变化判断界面是否还在。
+SELECTION_LUMINANCE_DELTA = 45.0
 ANALYSIS_STABILITY_ATTEMPTS = 3
 ANALYSIS_STABILITY_INTERVAL = 0.08
 ANALYSIS_RETRY_ATTEMPTS = 2
@@ -116,6 +120,15 @@ COLORS = {
     "error":  "#FF3333",  # 红色
     "bg":     "#000000"   # 背景黑
 }
+
+
+def log_engine_event(text):
+    """打包版无控制台，界面清除诊断写入运行目录日志便于排查。"""
+    try:
+        with open(os.path.join(BASE_DIR, "engine_debug.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except OSError:
+        pass
 
 RECOMMENDATION_TEXT_COLORS = {
     "normal": (56, 209, 90, 255),
@@ -407,7 +420,7 @@ class GameAnalyzer:
         self._cache_hero = None
         self._analysis_cache = {}
         self._round_signatures = {}
-        self._display_signatures = {}
+        self._display_luminance = {}
         self._selection_change_polls = 0
         self._last_capture_stable = False
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
@@ -418,7 +431,7 @@ class GameAnalyzer:
         self._cache_hero = None
         self._analysis_cache.clear()
         self._round_signatures.clear()
-        self._display_signatures.clear()
+        self._display_luminance.clear()
         self._selection_change_polls = 0
         self._last_capture_stable = False
 
@@ -476,18 +489,45 @@ class GameAnalyzer:
         )
 
     def check_selection_completed(self):
-        """检查 F6 后海克斯界面是否已消失，连续确认后返回 True。"""
-        if not self._display_signatures:
+        """检查海克斯界面是否已消失：标题条带持续变亮说明卡片与暗色遮罩都不在了。"""
+        if not self._display_luminance:
             return False
 
         images = self.capture_all_regions()
-        signatures = self._signatures_for_images(images)
-        changed = self._changed_region_count(signatures, self._display_signatures)
-        if changed >= ANALYSIS_CHANGED_REGION_COUNT:
+        bright = 0
+        for key, base_lum in self._display_luminance.items():
+            img = images.get(key)
+            if img is None:
+                continue
+            if float(np.mean(img)) >= base_lum + SELECTION_LUMINANCE_DELTA:
+                bright += 1
+
+        if bright >= ANALYSIS_CHANGED_REGION_COUNT:
             self._selection_change_polls += 1
         else:
             self._selection_change_polls = 0
-        return self._selection_change_polls >= SELECTION_CONFIRMATION_POLLS
+        completed = self._selection_change_polls >= SELECTION_CONFIRMATION_POLLS
+        if completed:
+            current = {
+                key: round(float(np.mean(images[key])), 1)
+                for key in self._display_luminance
+                if key in images
+            }
+            log_engine_event(
+                f"界面消失确认: 当前亮度 {current}, 基准 {self._display_luminance}"
+            )
+        return completed
+
+    def prime_selection_baseline(self):
+        """覆盖层显示后重新采样界面基准，排除自身覆盖内容对亮度基准的影响。"""
+        images = self.capture_all_regions()
+        luminance = {
+            key: float(np.mean(img)) for key, img in images.items() if img is not None
+        }
+        if luminance:
+            self._display_luminance = luminance
+            self._selection_change_polls = 0
+            log_engine_event(f"基准亮度: {luminance}")
 
     def _warmup(self):
         """用小图预热 OCR 引擎, 消除首次 F6 的冷启动延迟"""
@@ -626,7 +666,9 @@ class GameAnalyzer:
             self._round_signatures.clear()
         if not self._round_signatures:
             self._round_signatures.update(signatures)
-        self._display_signatures = dict(signatures)
+        self._display_luminance = {
+            key: float(np.mean(img)) for key, img in images.items() if img is not None
+        }
         self._selection_change_polls = 0
 
         # OCR 识别 + 数据匹配 (自适应并发策略)
@@ -901,9 +943,6 @@ class OverlayApp:
             # 渲染下方图片UI
             self._render_image_card(key, info)
 
-        # 结果显示5秒后消失
-        self.hide_timer = self.root.after(5000, self.clear_display)
-
 # ================= 4. 控制逻辑 (Controller) =================
 
 class InputController(threading.Thread):
@@ -1056,6 +1095,11 @@ class InputController(threading.Thread):
         self.flush_input()
         print(f"[监听中...] 当前英雄: {self.current_hero} | F6分析 / F7刷新 / F8手动")
 
+        # 推荐必须持续显示到海克斯界面消失（亮度基准连续确认）才能清除。
+        selection_watch = False
+        selection_baseline_ready = False
+        last_watch_poll = 0.0
+
         while True:
             now = time.time()
 
@@ -1064,10 +1108,17 @@ class InputController(threading.Thread):
                 if not self.current_hero:
                     self.queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 自动获取或 F8 手动输入"})
                     continue
-                
+
                 self.queue.put({"cmd": "STATUS", "data": f"🔎 正在分析 [{self.current_hero}]..."})
                 results = self.analyzer.analyze(self.current_hero)
+                if not any(item.get("valid") for item in results.values()):
+                    # 一个海克斯都没识别到时不出推荐卡片，避免错误卡片遮挡且无法自动清除
+                    self.queue.put({"cmd": "STATUS", "data": "❌ 未检测到海克斯选项\n请对准选择界面后重按 F6"})
+                    continue
                 self.queue.put({"cmd": "UPDATE", "data": results})
+                selection_watch = True
+                selection_baseline_ready = False
+                last_watch_poll = now  # 首次轮询延后一个间隔，等覆盖层先渲染完
 
             if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
                 self._last_f7 = now
@@ -1088,6 +1139,17 @@ class InputController(threading.Thread):
                 self._last_f8 = now
                 time.sleep(0.5)
                 return  # 退出监听，回到 select_hero_phase
+
+            # 低频监测海克斯界面是否消失：首次先采亮度基准，之后连续确认变亮才清除
+            if selection_watch and now - last_watch_poll >= SELECTION_POLL_INTERVAL:
+                last_watch_poll = now
+                if not selection_baseline_ready:
+                    self.analyzer.prime_selection_baseline()
+                    selection_baseline_ready = True
+                elif self.analyzer.check_selection_completed():
+                    selection_watch = False
+                    self.queue.put({"cmd": "CLEAR"})
+                    self.queue.put({"cmd": "STATUS", "data": "✓ 已选完，推荐已关闭"})
 
             time.sleep(0.05)
 
