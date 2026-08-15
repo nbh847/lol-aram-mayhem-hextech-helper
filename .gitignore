@@ -210,5 +210,8 @@ __marimo__/
 # 项目运行时状态 (每个用户独立, 不该提交)
 config.json
 
+# 本地渲染预览截图 (仅 preview_overlay 测试用, 不提交)
+data/lol-hex-view.png
+
 # ZCode 工具内部目录
 .zcode/
