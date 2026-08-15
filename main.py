@@ -38,6 +38,10 @@ ANALYSIS_SIGNATURE_SIZE = (96, 18)
 ANALYSIS_CHANGE_THRESHOLD = 0.20
 ANALYSIS_CHANGED_REGION_COUNT = 2
 SELECTION_CONFIRMATION_POLLS = 2
+ANALYSIS_STABILITY_ATTEMPTS = 3
+ANALYSIS_STABILITY_INTERVAL = 0.08
+ANALYSIS_RETRY_ATTEMPTS = 2
+ANALYSIS_RETRY_INTERVAL = 0.08
 
 
 def get_ui_transform(width, height):
@@ -405,6 +409,7 @@ class GameAnalyzer:
         self._round_signatures = {}
         self._display_signatures = {}
         self._selection_change_polls = 0
+        self._last_capture_stable = False
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
         self._warmup()
 
@@ -415,6 +420,7 @@ class GameAnalyzer:
         self._round_signatures.clear()
         self._display_signatures.clear()
         self._selection_change_polls = 0
+        self._last_capture_stable = False
 
     @staticmethod
     def _image_signature(img):
@@ -516,6 +522,37 @@ class GameAnalyzer:
             print(f"批量截图失败: {e}")
         return images
 
+    def capture_stable_regions(self):
+        """连续取样，优先返回不再变化的海克斯画面，避开入场动画帧。"""
+        self._last_capture_stable = False
+        images = self.capture_all_regions()
+        if not images:
+            return {}
+
+        previous_signatures = self._signatures_for_images(images)
+        expected_keys = set(REGIONS)
+        for _ in range(ANALYSIS_STABILITY_ATTEMPTS - 1):
+            time.sleep(ANALYSIS_STABILITY_INTERVAL)
+            current = self.capture_all_regions()
+            if not current:
+                continue
+
+            current_signatures = self._signatures_for_images(current)
+            complete = (
+                set(images) == expected_keys
+                and set(current) == expected_keys
+                and self._changed_region_count(
+                    current_signatures, previous_signatures
+                ) == 0
+            )
+            images = current
+            previous_signatures = current_signatures
+            if complete:
+                self._last_capture_stable = True
+                return images
+
+        return images
+
     def _ocr_and_match(self, key, img, hero_cn):
         """对单张已截取的图片执行 OCR 识别 + 数据匹配"""
         try:
@@ -534,6 +571,7 @@ class GameAnalyzer:
             if not txt:
                 res["text"] = "❌ 无文字"
                 res["error"] = True
+                print(f"OCR 失败 ({key}): 未检测到文字")
                 return res
 
             hero_augments = self.dm.hero_data.get(hero_cn, {})
@@ -567,6 +605,10 @@ class GameAnalyzer:
             else:
                 res["text"] = "❌ 未识别"
                 res["error"] = True
+                print(
+                    f"OCR 失败 ({key}): 原始文本={txt!r}, "
+                    f"最佳匹配={match!r}, 分数={score:.1f}"
+                )
             
             return res
             
@@ -574,21 +616,10 @@ class GameAnalyzer:
             print(f"处理异常 ({key}): {e}")
             return {"key": key, "text": "Error", "error": True}
 
-    def analyze(self, hero_cn):
-        if not hero_cn: return {}
-        print(f"正在分析: {hero_cn}...")
-
-        if self._cache_hero != hero_cn:
-            self.clear_analysis_cache()
-            self._cache_hero = hero_cn
-
-        # 阶段1: 批量截图 (复用 mss 上下文, 总耗时 ~18ms)
-        images = self.capture_all_regions()
-        if not images:
-            return {}
-
+    def _analyze_frame(self, images, hero_cn):
+        """分析一组截图，并返回结果及是否检测到新一轮界面。"""
         signatures = self._signatures_for_images(images)
-        round_changed = self._is_new_round(signatures)
+        round_changed = self._last_capture_stable and self._is_new_round(signatures)
         if round_changed:
             print("检测到新的海克斯界面轮次，清除上一轮识别缓存")
             self._analysis_cache.clear()
@@ -598,9 +629,8 @@ class GameAnalyzer:
         self._display_signatures = dict(signatures)
         self._selection_change_polls = 0
 
-        # 阶段2: OCR 识别 + 匹配 (自适应并发策略)
+        # OCR 识别 + 数据匹配 (自适应并发策略)
         results = {}
-        valid_matches = []
 
         def analyze_region(key, img):
             cached = self._analysis_cache.get(key)
@@ -632,7 +662,6 @@ class GameAnalyzer:
                 try:
                     data = f.result()
                     results[data["key"]] = data
-                    if data.get("valid"): valid_matches.append(data)
                 except Exception as e:
                     print(f"并发任务异常: {e}")
         else:
@@ -640,7 +669,14 @@ class GameAnalyzer:
             for key, img in images.items():
                 data = analyze_region(key, img)
                 results[data["key"]] = data
-                if data.get("valid"): valid_matches.append(data)
+
+        return results, round_changed
+
+    def _mark_best_result(self, results):
+        """根据当前合并后的有效结果重新标记最优推荐。"""
+        valid_matches = [item for item in results.values() if item.get("valid")]
+        for item in results.values():
+            item["highlight"] = False
 
         # 计算最优推荐：总排名优先（越小越好），总排名相同则按等级排序
         if valid_matches:
@@ -655,8 +691,42 @@ class GameAnalyzer:
             for item in valid_matches:
                 if sort_key(item) == best_key:
                     results[item['key']]["highlight"] = True
-        
-        return results
+
+    def analyze(self, hero_cn):
+        if not hero_cn: return {}
+        print(f"正在分析: {hero_cn}...")
+
+        if self._cache_hero != hero_cn:
+            self.clear_analysis_cache()
+            self._cache_hero = hero_cn
+
+        # 先取稳定帧；某些卡片仍未完成渲染时，只重试未完成的识别项。
+        merged_results = {}
+        for attempt in range(ANALYSIS_RETRY_ATTEMPTS + 1):
+            images = self.capture_stable_regions()
+            if not images:
+                break
+
+            frame_results, round_changed = self._analyze_frame(images, hero_cn)
+            if round_changed:
+                # 新轮次不能沿用上一轮已经合并到本地的结果。
+                merged_results.clear()
+            for key, data in frame_results.items():
+                if data.get("valid") or key not in merged_results:
+                    merged_results[key] = data
+
+            complete = (
+                set(merged_results) >= set(REGIONS)
+                and all(merged_results[key].get("valid") for key in REGIONS)
+            )
+            if complete or attempt >= ANALYSIS_RETRY_ATTEMPTS:
+                break
+
+            print(f"识别存在未完成项，准备第 {attempt + 1} 次重试")
+            time.sleep(ANALYSIS_RETRY_INTERVAL)
+
+        self._mark_best_result(merged_results)
+        return merged_results
 
 # ================= 3. UI 界面 (View) =================
 
