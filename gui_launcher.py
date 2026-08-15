@@ -91,6 +91,9 @@ class GUIController(threading.Thread):
         self._last_f6 = 0
         self._last_f7 = 0
         self._last_f8 = 0
+        self._overlay_active = False
+        self._last_overlay_check = 0.0
+        self._overlay_check_interval = 0.35
 
     def run(self):
         """主循环: 自动检测 → 监听"""
@@ -104,6 +107,30 @@ class GUIController(threading.Thread):
     def _gui(self, **kwargs):
         """发送消息到 GUI"""
         self.gui_queue.put(kwargs)
+
+    def _clear_overlay_and_cache(self, reason=None):
+        """清除覆盖层和当前轮次识别缓存。"""
+        self.analyzer.clear_analysis_cache()
+        self.overlay_queue.put({"cmd": "CLEAR"})
+        self._overlay_active = False
+        self._last_overlay_check = 0.0
+        if reason:
+            print(reason)
+
+    def _check_overlay_closed(self, now):
+        """低频检查海克斯界面是否已因用户选择而消失。"""
+        if not self._overlay_active:
+            return
+        if now - self._last_overlay_check < self._overlay_check_interval:
+            return
+        self._last_overlay_check = now
+        try:
+            if self.analyzer.check_selection_completed():
+                self._clear_overlay_and_cache(
+                    "检测到海克斯选择界面已关闭，已清除推荐覆盖层"
+                )
+        except Exception as exc:
+            print(f"覆盖层关闭检测失败: {exc}")
 
     def _validate_hero(self, name):
         """验证英雄名是否在数据库中，尝试模糊映射"""
@@ -146,6 +173,7 @@ class GUIController(threading.Thread):
         """手动设置英雄 (供 GUI 调用)"""
         validated = self._validate_hero(hero_name)
         if validated:
+            self._clear_overlay_and_cache()
             self.current_hero = validated
             print(f"✅ 已手动锁定英雄: {validated}")
             self._gui(event="hero_found", hero=validated, source="手动输入")
@@ -169,6 +197,8 @@ class GUIController(threading.Thread):
             verbose = (attempt == 0 or attempt % 5 == 0)
             hero, source = self._try_auto_detect(verbose=verbose)
             if hero:
+                if hero != self.current_hero:
+                    self._clear_overlay_and_cache()
                 self.current_hero = hero
                 print(f"✅ 自动识别到英雄: [{hero}] (来源: {source})")
                 self._gui(event="hero_found", hero=hero, source=source)
@@ -198,6 +228,7 @@ class GUIController(threading.Thread):
 
         while self.running:
             now = time.time()
+            self._check_overlay_closed(now)
 
             # F6 - 分析海克斯
             if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
@@ -211,12 +242,15 @@ class GUIController(threading.Thread):
                     print(f"正在分析: {self.current_hero}...")
                     results = self.analyzer.analyze(self.current_hero)
                     self.overlay_queue.put({"cmd": "UPDATE", "data": results})
+                    self._overlay_active = bool(results)
+                    self._last_overlay_check = time.time()
                     self._gui(event="status", status="analyzed", hero=self.current_hero)
                     print(f"分析完成: {self.current_hero}")
 
             # F7 - 刷新英雄
             if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
                 self._last_f7 = now
+                self._clear_overlay_and_cache()
                 self._gui(event="status", status="refreshing")
                 self.overlay_queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
                 hero, source = self._try_auto_detect()
@@ -237,6 +271,7 @@ class GUIController(threading.Thread):
                 self._last_f8 = now
                 print("F8: 重新进入自动检测阶段")
                 self._gui(event="status", status="resetting")
+                self._clear_overlay_and_cache()
                 self.current_hero = None
                 time.sleep(0.5)
                 return  # 退出 listening_phase, 回到 auto_detect

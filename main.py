@@ -34,6 +34,10 @@ REFERENCE_OVERLAY_HEIGHT = 130
 REFERENCE_TEXT_TOP = 506
 RECOMMENDATION_TEMPLATE_SIZE = (1740, 904)
 RECOMMENDATION_CROP = (120, 50, 1620, 840)
+ANALYSIS_SIGNATURE_SIZE = (96, 18)
+ANALYSIS_CHANGE_THRESHOLD = 0.20
+ANALYSIS_CHANGED_REGION_COUNT = 2
+SELECTION_CONFIRMATION_POLLS = 2
 
 
 def get_ui_transform(width, height):
@@ -394,8 +398,90 @@ class GameAnalyzer:
         self._cpu_count = os.cpu_count() or 4
         self._use_parallel = self._cpu_count >= 12
         self.executor = ThreadPoolExecutor(max_workers=3)
+        # 识别缓存只在当前海克斯界面轮次内有效。每个位置独立缓存，
+        # 某一张卡 OCR 失败时不会覆盖其他位置已经识别成功的结果。
+        self._cache_hero = None
+        self._analysis_cache = {}
+        self._round_signatures = {}
+        self._display_signatures = {}
+        self._selection_change_polls = 0
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
         self._warmup()
+
+    def clear_analysis_cache(self):
+        """清除当前轮次的 OCR 结果及界面变化基准。"""
+        self._cache_hero = None
+        self._analysis_cache.clear()
+        self._round_signatures.clear()
+        self._display_signatures.clear()
+        self._selection_change_polls = 0
+
+    @staticmethod
+    def _image_signature(img):
+        """生成对轻微动画/抗锯齿变化不敏感的低分辨率灰度签名。"""
+        if img is None:
+            return None
+        try:
+            gray = Image.fromarray(np.asarray(img, dtype=np.uint8)).convert("L")
+            small = gray.resize(ANALYSIS_SIGNATURE_SIZE, Image.BILINEAR)
+            values = np.asarray(small, dtype=np.float32) / 255.0
+            # 量化并去除整体亮度差，保留文字轮廓变化。
+            values = np.round(values * 16.0) / 16.0
+            values -= values.mean()
+            std = values.std()
+            if std < 1e-6:
+                return np.zeros_like(values)
+            return values / std
+        except (TypeError, ValueError, OSError):
+            return None
+
+    @staticmethod
+    def _signature_distance(first, second):
+        if first is None or second is None:
+            return None
+        if first.shape != second.shape:
+            return None
+        return float(np.mean(np.abs(first - second)))
+
+    def _signatures_for_images(self, images):
+        signatures = {}
+        for key, image in images.items():
+            signature = self._image_signature(image)
+            if signature is not None:
+                signatures[key] = signature
+        return signatures
+
+    def _changed_region_count(self, current, reference):
+        """统计发生明显变化的 OCR 区域，截图失败的区域不参与判断。"""
+        changed = 0
+        for key, old_signature in reference.items():
+            if key not in current:
+                continue
+            distance = self._signature_distance(current[key], old_signature)
+            if distance is not None and distance >= ANALYSIS_CHANGE_THRESHOLD:
+                changed += 1
+        return changed
+
+    def _is_new_round(self, signatures):
+        return (
+            bool(self._round_signatures)
+            and self._changed_region_count(signatures, self._round_signatures)
+            >= ANALYSIS_CHANGED_REGION_COUNT
+        )
+
+    def check_selection_completed(self):
+        """检查 F6 后海克斯界面是否已消失，连续确认后返回 True。"""
+        if not self._display_signatures:
+            return False
+
+        images = self.capture_all_regions()
+        signatures = self._signatures_for_images(images)
+        changed = self._changed_region_count(signatures, self._display_signatures)
+        if changed >= ANALYSIS_CHANGED_REGION_COUNT:
+            self._selection_change_polls += 1
+        else:
+            self._selection_change_polls = 0
+        return self._selection_change_polls >= SELECTION_CONFIRMATION_POLLS
 
     def _warmup(self):
         """用小图预热 OCR 引擎, 消除首次 F6 的冷启动延迟"""
@@ -491,19 +577,57 @@ class GameAnalyzer:
     def analyze(self, hero_cn):
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
-        
+
+        if self._cache_hero != hero_cn:
+            self.clear_analysis_cache()
+            self._cache_hero = hero_cn
+
         # 阶段1: 批量截图 (复用 mss 上下文, 总耗时 ~18ms)
         images = self.capture_all_regions()
-        
+        if not images:
+            return {}
+
+        signatures = self._signatures_for_images(images)
+        round_changed = self._is_new_round(signatures)
+        if round_changed:
+            print("检测到新的海克斯界面轮次，清除上一轮识别缓存")
+            self._analysis_cache.clear()
+            self._round_signatures.clear()
+        if not self._round_signatures:
+            self._round_signatures.update(signatures)
+        self._display_signatures = dict(signatures)
+        self._selection_change_polls = 0
+
         # 阶段2: OCR 识别 + 匹配 (自适应并发策略)
         results = {}
         valid_matches = []
+
+        def analyze_region(key, img):
+            cached = self._analysis_cache.get(key)
+            signature = signatures.get(key)
+            distance = self._signature_distance(
+                signature,
+                cached["signature"] if cached else None,
+            )
+            if cached and distance is not None and distance < ANALYSIS_CHANGE_THRESHOLD:
+                return dict(cached["result"])
+
+            data = self._ocr_and_match(key, img, hero_cn)
+            if data.get("valid"):
+                self._analysis_cache[key] = {
+                    "signature": signature,
+                    "result": dict(data),
+                }
+            elif cached and not round_changed:
+                # OCR 短暂漏检时保留本轮之前已经确认成功的结果。
+                return dict(cached["result"])
+            return data
 
         if self._use_parallel:
             # 高端 CPU (>=12 线程): 并发 OCR, 充分利用多核
             futures = []
             for key in images:
-                futures.append(self.executor.submit(self._ocr_and_match, key, images[key], hero_cn))
+                futures.append(self.executor.submit(analyze_region, key, images[key]))
             for f in futures:
                 try:
                     data = f.result()
@@ -514,7 +638,7 @@ class GameAnalyzer:
         else:
             # 低端 CPU (<12 线程): 串行 OCR, 避免缓存争抢和线程切换开销
             for key, img in images.items():
-                data = self._ocr_and_match(key, img, hero_cn)
+                data = analyze_region(key, img)
                 results[data["key"]] = data
                 if data.get("valid"): valid_matches.append(data)
 
