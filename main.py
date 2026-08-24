@@ -936,7 +936,6 @@ class OverlayApp:
         self._setup_window()
         self._load_templates()
         self._setup_labels()
-        self._show_window()
 
         # 启动队列消息监听
         self.root.after(100, self.process_queue)
@@ -1122,13 +1121,8 @@ class OverlayApp:
         self._hide_window()
 
     def show_status(self, text):
+        """状态仅由主窗口展示；全屏覆盖层只承载海克斯推荐。"""
         self.clear_display()
-        lbl = self.labels['hex_2']
-        lbl.config(text=text, fg=COLORS["status"])
-        lbl.place(relx=0.5, rely=0.5, anchor="center")
-        self._show_window()
-        # 状态提示2秒后消失
-        self.hide_timer = self.root.after(2000, self.clear_display)
 
     def update_display(self, results):
         self.clear_display()

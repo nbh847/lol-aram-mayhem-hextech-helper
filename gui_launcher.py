@@ -773,6 +773,7 @@ class LauncherApp:
         # 状态变量
         self.engine_running = False
         self.engine_starting = False
+        self._engine_generation = 0
         self.controller = None
         self.overlay = None
         self.overlay_window = None
@@ -1048,6 +1049,8 @@ class LauncherApp:
             return
 
         self.engine_starting = True
+        self._engine_generation += 1
+        generation = self._engine_generation
         self.start_btn.pack_forget()
         self._pack_engine_button(self.stop_btn)
         self.start_btn.config(state=tk.DISABLED)
@@ -1056,26 +1059,37 @@ class LauncherApp:
         self._log("正在初始化 OCR 引擎...")
 
         def _init():
+            analyzer = None
             try:
-                from main import GameAnalyzer, OverlayApp
+                from main import GameAnalyzer
                 from scripts.lcu_connector import LCUConnector
 
                 # 初始化分析器 (加载 OCR 模型)
-                self.analyzer = GameAnalyzer(self.dm)
+                analyzer = GameAnalyzer(self.dm)
                 self._log("✅ OCR 引擎就绪")
 
                 # 初始化 LCU 连接器
                 champions_json = os.path.join(self.dm.data_dir, 'champions.json')
-                self.lcu = LCUConnector(champions_json)
+                lcu = LCUConnector(champions_json)
                 self._log("✅ LCU 连接器就绪")
 
-                # 在主线程创建 overlay
-                self.gui_queue.put({"event": "create_overlay"})
+                # 在主线程确认本次启动仍有效，再接管资源并创建 overlay。
+                self.gui_queue.put({
+                    "event": "create_overlay",
+                    "generation": generation,
+                    "analyzer": analyzer,
+                    "lcu": lcu,
+                })
 
             except Exception as e:
+                if analyzer is not None:
+                    analyzer.executor.shutdown(wait=False, cancel_futures=True)
                 self._log(f"❌ 引擎启动失败: {e}")
                 traceback.print_exc()
-                self.gui_queue.put({"event": "engine_error"})
+                self.gui_queue.put({
+                    "event": "engine_error",
+                    "generation": generation,
+                })
 
         threading.Thread(target=_init, daemon=True).start()
 
@@ -1127,11 +1141,16 @@ class LauncherApp:
 
     def _engine_cleanup(self):
         """清理引擎资源"""
+        self._engine_generation += 1
         self.engine_starting = False
         self.engine_running = False
         if self.controller:
             self.controller.stop()
             self.controller = None
+        if self.analyzer:
+            self.analyzer.executor.shutdown(wait=False, cancel_futures=True)
+            self.analyzer = None
+        self.lcu = None
         if self.overlay_window:
             try:
                 self.overlay_window.destroy()
@@ -1325,10 +1344,20 @@ class LauncherApp:
             self._set_start_button_state()
 
         elif event == "create_overlay":
+            analyzer = msg.get("analyzer")
+            if (msg.get("generation") != self._engine_generation or
+                    not self.engine_starting):
+                if analyzer is not None:
+                    analyzer.executor.shutdown(wait=False, cancel_futures=True)
+                return
+            self.analyzer = analyzer
+            self.lcu = msg.get("lcu")
             self._create_overlay_and_start()
 
         elif event == "engine_error":
-            self._stop_engine()
+            if (msg.get("generation") == self._engine_generation and
+                    self.engine_starting):
+                self._stop_engine()
 
         elif event == "hero_found":
             hero = msg.get("hero", "")
