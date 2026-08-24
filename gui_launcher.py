@@ -363,9 +363,19 @@ class GUIController(threading.Thread):
                     self._gui(event="status", status="no_hero_warning")
                 else:
                     self._gui(event="status", status="analyzing", hero=self.current_hero)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]..."})
+                    self.overlay_queue.put({"cmd": "ANALYZING", "data": "匹配海克斯中..."})
                     print(f"正在分析: {self.current_hero}...")
-                    results = self.analyzer.analyze(self.current_hero)
+                    try:
+                        results = self.analyzer.analyze(self.current_hero)
+                    except Exception as exc:
+                        self._clear_overlay_and_cache()
+                        self._gui(
+                            event="status",
+                            status="analysis_error",
+                            hero=self.current_hero,
+                        )
+                        print(f"海克斯分析失败: {exc}")
+                        continue
                     if not any(item.get("valid") for item in results.values()):
                         self._clear_overlay_and_cache()
                         self.overlay_queue.put({
@@ -1404,6 +1414,7 @@ class LauncherApp:
                 "listening":        ("监听中", self.SUCCESS),
                 "analyzing":        ("分析中...", self.ACCENT),
                 "analyzed":         ("分析完成", self.SUCCESS),
+                "analysis_error":    ("分析失败", self.ERROR),
                 "no_augment_found": ("未检测到海克斯", self.WARNING),
                 "refreshing":       ("刷新英雄...", self.WARNING),
                 "no_hero_warning":  ("未锁定英雄", self.ERROR),

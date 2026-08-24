@@ -980,11 +980,16 @@ class OverlayApp:
         with mss.mss() as sct:
             m = sct.monitors[0]
             self.offset_x, self.offset_y = m['left'], m['top']
-            self.root.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
+            self._window_geometry = f"{m['width']}x{m['height']}+{m['left']}+{m['top']}"
+            self._hidden_geometry = f"1x1+{m['left']}+{m['top']}"
+            self.root.geometry(self._window_geometry)
 
     def _show_window(self):
         """显示覆盖层，并同步恢复原生窗口状态。"""
+        self.root.geometry(self._window_geometry)
         self.root.deiconify()
+        # withdraw/deiconify 后由 Tk 重新设置透明键，避免沿用隐藏阶段的 alpha 状态。
+        self.root.attributes("-transparentcolor", COLORS["bg"])
         self.root.update_idletasks()
         if self._hwnd:
             try:
@@ -1006,6 +1011,10 @@ class OverlayApp:
 
     def _hide_window(self):
         """隐藏覆盖层，并直接从 Windows 窗口层移除旧帧。"""
+        # 先收缩实际 Tk 窗口并提交一次重绘，再隐藏原生窗口；即使 DWM 缓存旧表面，
+        # 也只会留下一个透明像素，不会残留三张推荐卡片和文字。
+        self.root.geometry(self._hidden_geometry)
+        self.root.update_idletasks()
         self.root.withdraw()
         self.root.update_idletasks()
         if self._hwnd:
@@ -1022,6 +1031,10 @@ class OverlayApp:
                 show_window.restype = ctypes.c_bool
                 # SW_HIDE，确保透明无边框窗口不会继续参与桌面合成。
                 show_window(self._hwnd, 0)
+                dwm_flush = ctypes.windll.dwmapi.DwmFlush
+                dwm_flush.argtypes = []
+                dwm_flush.restype = ctypes.c_long
+                dwm_flush()
             except Exception as e:
                 print(f"覆盖层隐藏警告: {e}")
 
@@ -1093,6 +1106,8 @@ class OverlayApp:
                 
                 if cmd == "UPDATE":
                     self.update_display(data)
+                elif cmd == "ANALYZING":
+                    self.show_analysis_status(data)
                 elif cmd == "STATUS":
                     self.show_status(data)
                 elif cmd == "CLEAR":
@@ -1123,6 +1138,15 @@ class OverlayApp:
     def show_status(self, text):
         """状态仅由主窗口展示；全屏覆盖层只承载海克斯推荐。"""
         self.clear_display()
+
+    def show_analysis_status(self, text):
+        """F6 分析期间在游戏中央显示即时反馈，直到结果到达。"""
+        self.clear_display()
+        lbl = self.labels['hex_2']
+        lbl.config(text=text, fg=COLORS["status"], font=self.best_font_style)
+        lbl.place(relx=0.5, rely=0.5, anchor="center")
+        lbl.lift()
+        self._show_window()
 
     def update_display(self, results):
         self.clear_display()
@@ -1327,10 +1351,16 @@ class InputController(threading.Thread):
                     self.queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 自动获取或 F8 手动输入"})
                     continue
 
-                self.queue.put({"cmd": "STATUS", "data": f"🔎 正在分析 [{self.current_hero}]..."})
-                results = self.analyzer.analyze(self.current_hero)
+                self.queue.put({"cmd": "ANALYZING", "data": "匹配海克斯中..."})
+                try:
+                    results = self.analyzer.analyze(self.current_hero)
+                except Exception as exc:
+                    self.queue.put({"cmd": "CLEAR"})
+                    print(f"海克斯分析失败: {exc}")
+                    continue
                 if not any(item.get("valid") for item in results.values()):
                     # 一个海克斯都没识别到时不出推荐卡片，避免错误卡片遮挡且无法自动清除
+                    self.queue.put({"cmd": "CLEAR"})
                     self.queue.put({"cmd": "STATUS", "data": "❌ 未检测到海克斯选项\n请对准选择界面后重按 F6"})
                     continue
                 self.queue.put({"cmd": "UPDATE", "data": results})
