@@ -364,6 +364,7 @@ class GUIController(threading.Thread):
                 else:
                     self._gui(event="status", status="analyzing", hero=self.current_hero)
                     self.overlay_queue.put({"cmd": "ANALYZING", "data": "匹配海克斯中..."})
+                    analysis_baseline_ready = self.analyzer.prime_selection_baseline()
                     print(f"正在分析: {self.current_hero}...")
                     try:
                         results = self.analyzer.analyze(self.current_hero)
@@ -389,9 +390,22 @@ class GUIController(threading.Thread):
                         )
                         print("分析未检测到有效海克斯选项")
                         continue
+                    if (analysis_baseline_ready and
+                            self.analyzer.selection_closed_since_baseline()):
+                        self._clear_overlay_and_cache()
+                        self._gui(
+                            event="status",
+                            status="selection_completed",
+                            hero=self.current_hero,
+                        )
+                        print("分析期间已完成海克斯选择，丢弃迟到的推荐结果")
+                        continue
                     self.overlay_queue.put({"cmd": "UPDATE", "data": results})
                     self._overlay_active = bool(results)
-                    self._selection_baseline_ready = self.analyzer.prime_selection_baseline()
+                    self._selection_baseline_ready = (
+                        analysis_baseline_ready
+                        or self.analyzer.prime_selection_baseline()
+                    )
                     self._last_overlay_check = time.time()
                     self._gui(event="status", status="analyzed", hero=self.current_hero)
                     print(f"分析完成: {self.current_hero}")
@@ -1415,6 +1429,7 @@ class LauncherApp:
                 "analyzing":        ("分析中...", self.ACCENT),
                 "analyzed":         ("分析完成", self.SUCCESS),
                 "analysis_error":    ("分析失败", self.ERROR),
+                "selection_completed": ("已完成选择", self.SUCCESS),
                 "no_augment_found": ("未检测到海克斯", self.WARNING),
                 "refreshing":       ("刷新英雄...", self.WARNING),
                 "no_hero_warning":  ("未锁定英雄", self.ERROR),

@@ -677,8 +677,27 @@ class GameAnalyzer:
         return completed
 
     def prime_selection_baseline(self):
-        """覆盖层显示后重新采样卡片外框基准，排除覆盖层对检测的影响。"""
+        """采样并保存当前三张卡片外框基准。"""
         return self._store_frame_baseline(self.capture_frame_scores())
+
+    def selection_closed_since_baseline(self):
+        """分析结束前检查选择界面是否已相对 F6 基准关闭。"""
+        if not self._display_frame_scores:
+            return False
+        current = self.capture_frame_scores()
+        if not current:
+            return False
+        absent_keys = [
+            key for key in self._display_frame_scores
+            if current.get(key) is not None
+            and current[key] < SELECTION_FRAME_ABSENT_SCORE
+        ]
+        completed = len(absent_keys) >= SELECTION_FRAME_ABSENT_CARD_COUNT
+        log_engine_event(
+            f"分析结束界面复核: 当前外框={current}, 消失={absent_keys}, "
+            f"基准={self._display_frame_scores}, 已关闭={completed}"
+        )
+        return completed
 
     def _warmup(self):
         """用小图预热 OCR 引擎, 消除首次 F6 的冷启动延迟"""
@@ -1352,6 +1371,7 @@ class InputController(threading.Thread):
                     continue
 
                 self.queue.put({"cmd": "ANALYZING", "data": "匹配海克斯中..."})
+                analysis_baseline_ready = self.analyzer.prime_selection_baseline()
                 try:
                     results = self.analyzer.analyze(self.current_hero)
                 except Exception as exc:
@@ -1363,9 +1383,18 @@ class InputController(threading.Thread):
                     self.queue.put({"cmd": "CLEAR"})
                     self.queue.put({"cmd": "STATUS", "data": "❌ 未检测到海克斯选项\n请对准选择界面后重按 F6"})
                     continue
+                if (analysis_baseline_ready and
+                        self.analyzer.selection_closed_since_baseline()):
+                    self.analyzer.clear_analysis_cache()
+                    self.queue.put({"cmd": "CLEAR"})
+                    print("分析期间已完成海克斯选择，丢弃迟到的推荐结果")
+                    continue
                 self.queue.put({"cmd": "UPDATE", "data": results})
                 selection_watch = True
-                selection_baseline_ready = False
+                selection_baseline_ready = (
+                    analysis_baseline_ready
+                    or self.analyzer.prime_selection_baseline()
+                )
                 last_watch_poll = now  # 首次轮询延后一个间隔，等覆盖层先渲染完
 
             if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
