@@ -994,8 +994,9 @@ class OverlayApp:
                     ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint
                 ]
                 set_layered_alpha.restype = ctypes.c_bool
-                # LWA_ALPHA：恢复覆盖层的完全不透明状态（透明色仍负责背景镂空）。
-                set_layered_alpha(self._hwnd, 0, 255, 0x2)
+                # 同时保留 LWA_COLORKEY 和 LWA_ALPHA；若只传 LWA_ALPHA，Windows
+                # 会取消 Tk 设置的黑色透明键，整张全屏覆盖层就会显示为黑色。
+                set_layered_alpha(self._hwnd, 0, 255, 0x1 | 0x2)
                 show_window = ctypes.windll.user32.ShowWindow
                 show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
                 show_window.restype = ctypes.c_bool
@@ -1015,8 +1016,8 @@ class OverlayApp:
                     ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint
                 ]
                 set_layered_alpha.restype = ctypes.c_bool
-                # 先将分层窗口设为完全透明，再 SW_HIDE，避免 DWM 保留透明窗口旧帧。
-                set_layered_alpha(self._hwnd, 0, 0, 0x2)
+                # 先整体透明再 SW_HIDE，同时保留黑色透明键供下次显示使用。
+                set_layered_alpha(self._hwnd, 0, 0, 0x1 | 0x2)
                 show_window = ctypes.windll.user32.ShowWindow
                 show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
                 show_window.restype = ctypes.c_bool
