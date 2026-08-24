@@ -29,6 +29,31 @@ from PIL import Image, ImageDraw
 import pystray
 
 
+_INSTANCE_MUTEX = None
+
+
+def _acquire_single_instance():
+    """同一 Windows 会话只允许运行一个助手进程。"""
+    global _INSTANCE_MUTEX
+    if _INSTANCE_MUTEX is not None:
+        return False
+
+    create_mutex = ctypes.windll.kernel32.CreateMutexW
+    create_mutex.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    create_mutex.restype = ctypes.c_void_p
+    handle = create_mutex(None, False, "Local\\ARAMHextechHelperSingleInstance")
+    if not handle:
+        raise ctypes.WinError()
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        close_handle = ctypes.windll.kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_bool
+        close_handle(handle)
+        return False
+    _INSTANCE_MUTEX = handle
+    return True
+
+
 # ============ 统一配色方案 ============
 
 class Theme:
@@ -1590,6 +1615,13 @@ def main():
                     sys.exit(0)
                 except Exception:
                     pass  # 用户取消 UAC, 继续普通运行
+
+        if not _acquire_single_instance():
+            messagebox.showwarning(
+                "ARAM 海克斯助手",
+                "助手已经在运行，请检查主窗口或系统托盘。",
+            )
+            return
 
         app = LauncherApp()
         app.run()
