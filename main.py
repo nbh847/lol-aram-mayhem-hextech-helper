@@ -28,6 +28,19 @@ REFERENCE_REGIONS = {
     "hex_2": {'top': 540, 'left': 1130, 'width': 320, 'height': 60},
     "hex_3": {'top': 540, 'left': 1600, 'width': 320, 'height': 60},
 }
+# 三张海克斯卡片外框的参考范围。选择完成后卡片和这四条外框都会消失，
+# 检测它比 OCR 文字区域的亮度变化更直接，也不受卡片文字/流光动画影响。
+REFERENCE_FRAME_CARD_REGIONS = {
+    "hex_1": {'top': 273, 'left': 622,  'width': 404, 'height': 665},
+    "hex_2": {'top': 273, 'left': 1086, 'width': 404, 'height': 665},
+    "hex_3": {'top': 273, 'left': 1550, 'width': 404, 'height': 665},
+}
+REFERENCE_FRAME_BANDS = (
+    {'top': 1,   'left': 48,  'width': 308, 'height': 29},  # 上边框
+    {'top': 57,  'left': 5,   'width': 28,  'height': 550}, # 左边框
+    {'top': 57,  'left': 371, 'width': 28,  'height': 550}, # 右边框
+    {'top': 632, 'left': 48,  'width': 308, 'height': 29}, # 下边框
+)
 REFERENCE_OVERLAY_TOP = 742
 REFERENCE_OVERLAY_WIDTH = 248
 REFERENCE_OVERLAY_HEIGHT = 130
@@ -37,11 +50,16 @@ RECOMMENDATION_CROP = (120, 50, 1620, 840)
 ANALYSIS_SIGNATURE_SIZE = (96, 18)
 ANALYSIS_CHANGE_THRESHOLD = 0.20
 ANALYSIS_CHANGED_REGION_COUNT = 2
-SELECTION_CONFIRMATION_POLLS = 3
+SELECTION_CONFIRMATION_POLLS = 2
 SELECTION_POLL_INTERVAL = 0.3
-# 海克斯界面关闭时暗色遮罩 lifted + 近黑卡片背景消失, 标题条带亮度大幅上升;
-# 卡片流光/hover 动画不会让卡片内部持续变亮, 因此用亮度增量而非画面变化判断界面是否还在。
-SELECTION_LUMINANCE_DELTA = 45.0
+# 实际游戏中未 hover 的卡框可能变暗；评分同时考虑高亮像素占比和四条边的连续线覆盖率，
+# 避免死亡界面的文字/按钮亮度被误当成卡框。
+SELECTION_FRAME_PRESENT_SCORE = 0.35
+SELECTION_FRAME_ABSENT_SCORE = 0.30
+SELECTION_FRAME_LINE_COVERAGE = 0.20
+SELECTION_FRAME_ABSENT_CARD_COUNT = 2
+SELECTION_FRAME_MIN_CHANNEL = 105.0
+SELECTION_FRAME_MAX_CHANNEL_SPREAD = 110.0
 ANALYSIS_STABILITY_ATTEMPTS = 3
 ANALYSIS_STABILITY_INTERVAL = 0.08
 ANALYSIS_RETRY_ATTEMPTS = 2
@@ -74,6 +92,25 @@ def calculate_regions(width, height):
     }
 
 
+def calculate_frame_regions(width, height):
+    """计算卡片外框截图范围及其四条边框在截图中的局部坐标。"""
+    scale, offset_x, offset_y = get_ui_transform(width, height)
+    regions = {}
+    for key, card in REFERENCE_FRAME_CARD_REGIONS.items():
+        capture = _scale_reference_region(card, scale, offset_x, offset_y)
+        bands = [
+            {
+                'top': int(round(band['top'] * scale)),
+                'left': int(round(band['left'] * scale)),
+                'width': max(1, int(round(band['width'] * scale))),
+                'height': max(1, int(round(band['height'] * scale))),
+            }
+            for band in REFERENCE_FRAME_BANDS
+        ]
+        regions[key] = {'capture': capture, 'bands': bands}
+    return regions
+
+
 def get_regions():
     """计算当前主屏幕上的海克斯文字截取区域。"""
     with mss.mss() as sct:
@@ -81,6 +118,15 @@ def get_regions():
     return calculate_regions(mon['width'], mon['height'])
 
 REGIONS = get_regions()
+
+
+def get_frame_regions():
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+    return calculate_frame_regions(mon['width'], mon['height'])
+
+
+FRAME_REGIONS = get_frame_regions()
 
 def calculate_overlay_regions(width, height):
     """
@@ -420,8 +466,10 @@ class GameAnalyzer:
         self._cache_hero = None
         self._analysis_cache = {}
         self._round_signatures = {}
-        self._display_luminance = {}
+        self._display_frame_scores = {}
         self._selection_change_polls = 0
+        self._selection_absent_streaks = {}
+        self._selection_check_count = 0
         self._last_capture_stable = False
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
         self._warmup()
@@ -431,8 +479,10 @@ class GameAnalyzer:
         self._cache_hero = None
         self._analysis_cache.clear()
         self._round_signatures.clear()
-        self._display_luminance.clear()
+        self._display_frame_scores.clear()
         self._selection_change_polls = 0
+        self._selection_absent_streaks.clear()
+        self._selection_check_count = 0
         self._last_capture_stable = False
 
     @staticmethod
@@ -488,46 +538,147 @@ class GameAnalyzer:
             >= ANALYSIS_CHANGED_REGION_COUNT
         )
 
+    @staticmethod
+    def _frame_presence_score(image, bands):
+        """计算四条边框的高亮占比与连续线结构评分。"""
+        if image is None:
+            return None
+        try:
+            values = np.asarray(image, dtype=np.float32)
+            scores = []
+            for band in bands:
+                top = band['top']
+                left = band['left']
+                bottom = top + band['height']
+                right = left + band['width']
+                sample = values[top:bottom, left:right]
+                if sample.size == 0 or sample.ndim != 3 or sample.shape[2] < 3:
+                    continue
+                luminance = sample[:, :, :3].mean(axis=2)
+                spread = sample[:, :, :3].max(axis=2) - sample[:, :, :3].min(axis=2)
+                frame_pixels = (
+                    (sample[:, :, :3].min(axis=2) >= SELECTION_FRAME_MIN_CHANNEL)
+                    & (spread <= SELECTION_FRAME_MAX_CHANNEL_SPREAD)
+                    & (luminance >= 150.0)
+                )
+                pixel_score = float(frame_pixels.mean())
+                if band['width'] >= band['height']:
+                    line_coverage = frame_pixels.mean(axis=0)
+                else:
+                    line_coverage = frame_pixels.mean(axis=1)
+                continuity_score = float(
+                    (line_coverage >= SELECTION_FRAME_LINE_COVERAGE).mean()
+                )
+                scores.append((pixel_score + continuity_score) / 2.0)
+            return float(np.mean(scores)) if scores else None
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def capture_frame_scores(self):
+        """截图三张卡片的边框区域，返回每张卡片的外框存在评分。"""
+        scores = {}
+        try:
+            with mss.mss() as sct:
+                for key, frame in FRAME_REGIONS.items():
+                    region = frame['capture']
+                    monitor = {
+                        'top': int(region['top']),
+                        'left': int(region['left']),
+                        'width': int(region['width']),
+                        'height': int(region['height']),
+                        'mon': 0,
+                    }
+                    raw = sct.grab(monitor)
+                    image = np.asarray(
+                        Image.frombytes('RGB', raw.size, raw.rgb),
+                        dtype=np.uint8,
+                    )
+                    score = self._frame_presence_score(image, frame['bands'])
+                    if score is not None:
+                        scores[key] = round(score, 3)
+        except Exception as e:
+            print(f"卡片外框截图失败: {e}")
+        return scores
+
+    def _store_frame_baseline(self, scores):
+        if not scores:
+            return False
+        present_count = sum(
+            score >= SELECTION_FRAME_PRESENT_SCORE for score in scores.values()
+        )
+        if present_count < SELECTION_FRAME_ABSENT_CARD_COUNT:
+            return False
+        self._display_frame_scores = dict(scores)
+        self._selection_change_polls = 0
+        self._selection_absent_streaks = {key: 0 for key in scores}
+        self._selection_check_count = 0
+        log_engine_event(f"卡片外框基准: {scores}")
+        return True
+
     def check_selection_completed(self):
-        """检查海克斯界面是否已消失：标题条带持续变亮说明卡片与暗色遮罩都不在了。"""
-        if not self._display_luminance:
+        """检查三张海克斯卡片外框是否已消失。"""
+        self._selection_check_count += 1
+        check_count = self._selection_check_count
+        if not self._display_frame_scores:
+            if check_count <= 3 or check_count % 10 == 0:
+                log_engine_event("界面检测跳过: 没有卡片外框基准")
             return False
 
-        images = self.capture_all_regions()
-        bright = 0
-        for key, base_lum in self._display_luminance.items():
-            img = images.get(key)
-            if img is None:
-                continue
-            if float(np.mean(img)) >= base_lum + SELECTION_LUMINANCE_DELTA:
-                bright += 1
+        current = self.capture_frame_scores()
+        if not current:
+            if check_count <= 3 or check_count % 10 == 0:
+                log_engine_event("界面检测失败: 卡片外框截图为空")
+            return False
 
-        if bright >= ANALYSIS_CHANGED_REGION_COUNT:
-            self._selection_change_polls += 1
-        else:
-            self._selection_change_polls = 0
-        completed = self._selection_change_polls >= SELECTION_CONFIRMATION_POLLS
-        if completed:
-            current = {
-                key: round(float(np.mean(images[key])), 1)
-                for key in self._display_luminance
-                if key in images
-            }
+        absent_keys = []
+        thresholds = {}
+        for key in self._display_frame_scores:
+            current_score = current.get(key)
+            if current_score is None:
+                continue
+            threshold = SELECTION_FRAME_ABSENT_SCORE
+            thresholds[key] = round(threshold, 3)
+            if current_score < threshold:
+                absent_keys.append(key)
+                self._selection_absent_streaks[key] = (
+                    self._selection_absent_streaks.get(key, 0) + 1
+                )
+            else:
+                self._selection_absent_streaks[key] = 0
+
+        confirmed_absent_keys = [
+            key for key, streak in self._selection_absent_streaks.items()
+            if streak >= SELECTION_CONFIRMATION_POLLS
+        ]
+        confirmed_streaks = [
+            self._selection_absent_streaks[key] for key in confirmed_absent_keys
+        ]
+        self._selection_change_polls = (
+            min(confirmed_streaks) if confirmed_streaks else 0
+        )
+
+        if (
+            check_count <= 3
+            or check_count % 10 == 0
+            or absent_keys
+        ):
             log_engine_event(
-                f"界面消失确认: 当前亮度 {current}, 基准 {self._display_luminance}"
+                f"界面检测: 当前外框={current}, 阈值={thresholds}, "
+                f"消失={absent_keys}, 连续={self._selection_absent_streaks}, "
+                f"确认={confirmed_absent_keys}, polls={self._selection_change_polls}, "
+                f"基准={self._display_frame_scores}"
+            )
+
+        completed = len(confirmed_absent_keys) >= SELECTION_FRAME_ABSENT_CARD_COUNT
+        if completed:
+            log_engine_event(
+                f"界面消失确认: 当前外框={current}, 基准={self._display_frame_scores}"
             )
         return completed
 
     def prime_selection_baseline(self):
-        """覆盖层显示后重新采样界面基准，排除自身覆盖内容对亮度基准的影响。"""
-        images = self.capture_all_regions()
-        luminance = {
-            key: float(np.mean(img)) for key, img in images.items() if img is not None
-        }
-        if luminance:
-            self._display_luminance = luminance
-            self._selection_change_polls = 0
-            log_engine_event(f"基准亮度: {luminance}")
+        """覆盖层显示后重新采样卡片外框基准，排除覆盖层对检测的影响。"""
+        return self._store_frame_baseline(self.capture_frame_scores())
 
     def _warmup(self):
         """用小图预热 OCR 引擎, 消除首次 F6 的冷启动延迟"""
@@ -666,9 +817,6 @@ class GameAnalyzer:
             self._round_signatures.clear()
         if not self._round_signatures:
             self._round_signatures.update(signatures)
-        self._display_luminance = {
-            key: float(np.mean(img)) for key, img in images.items() if img is not None
-        }
         self._selection_change_polls = 0
 
         # OCR 识别 + 数据匹配 (自适应并发策略)
@@ -781,13 +929,14 @@ class OverlayApp:
         self.image_photos = {}      # 保持 PhotoImage 引用, 防止 GC 回收
         self.templates = {}         # 缓存: {模板名: PIL.Image}
         self.hide_timer = None
+        self._hwnd = None
 
         # 先隐藏窗口，避免配置透明前闪白框
         self.root.withdraw()
         self._setup_window()
         self._load_templates()
         self._setup_labels()
-        self.root.deiconify()
+        self._show_window()
 
         # 启动队列消息监听
         self.root.after(100, self.process_queue)
@@ -798,13 +947,33 @@ class OverlayApp:
         self.root.attributes("-topmost", True) # 置顶
         self.root.config(bg=COLORS["bg"])
         self.root.attributes("-transparentcolor", COLORS["bg"]) # 背景透明
-        
+
+        # Tk 的透明无边框窗口在部分 Windows 合成场景下仅调用 withdraw() 仍可能
+        # 留下旧帧；保存真正的顶层 HWND，清除时再用 Win32 强制隐藏。
+        self.root.update_idletasks()
+        try:
+            tk_hwnd = ctypes.c_void_p(int(self.root.winfo_id()))
+            get_ancestor = ctypes.windll.user32.GetAncestor
+            get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            get_ancestor.restype = ctypes.c_void_p
+            self._hwnd = get_ancestor(tk_hwnd, 2) or tk_hwnd
+        except Exception as e:
+            print(f"覆盖层 HWND 获取警告: {e}")
+
         # 鼠标穿透设置 (Windows API)
         try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            old_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            hwnd = self._hwnd
+            if not hwnd:
+                raise RuntimeError("未获取到覆盖层 HWND")
+            get_window_long = ctypes.windll.user32.GetWindowLongW
+            get_window_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            get_window_long.restype = ctypes.c_long
+            set_window_long = ctypes.windll.user32.SetWindowLongW
+            set_window_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+            set_window_long.restype = ctypes.c_long
+            old_style = get_window_long(hwnd, -20)
             # WS_EX_LAYERED | WS_EX_TRANSPARENT
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, old_style | 0x80000 | 0x20)
+            set_window_long(hwnd, -20, old_style | 0x80000 | 0x20)
         except Exception as e:
             print(f"穿透设置警告: {e}")
 
@@ -813,6 +982,48 @@ class OverlayApp:
             m = sct.monitors[0]
             self.offset_x, self.offset_y = m['left'], m['top']
             self.root.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
+
+    def _show_window(self):
+        """显示覆盖层，并同步恢复原生窗口状态。"""
+        self.root.deiconify()
+        self.root.update_idletasks()
+        if self._hwnd:
+            try:
+                set_layered_alpha = ctypes.windll.user32.SetLayeredWindowAttributes
+                set_layered_alpha.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint
+                ]
+                set_layered_alpha.restype = ctypes.c_bool
+                # LWA_ALPHA：恢复覆盖层的完全不透明状态（透明色仍负责背景镂空）。
+                set_layered_alpha(self._hwnd, 0, 255, 0x2)
+                show_window = ctypes.windll.user32.ShowWindow
+                show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                show_window.restype = ctypes.c_bool
+                # SW_SHOWNOACTIVATE，避免覆盖层抢走游戏焦点。
+                show_window(self._hwnd, 4)
+            except Exception as e:
+                print(f"覆盖层显示警告: {e}")
+
+    def _hide_window(self):
+        """隐藏覆盖层，并直接从 Windows 窗口层移除旧帧。"""
+        self.root.withdraw()
+        self.root.update_idletasks()
+        if self._hwnd:
+            try:
+                set_layered_alpha = ctypes.windll.user32.SetLayeredWindowAttributes
+                set_layered_alpha.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint
+                ]
+                set_layered_alpha.restype = ctypes.c_bool
+                # 先将分层窗口设为完全透明，再 SW_HIDE，避免 DWM 保留透明窗口旧帧。
+                set_layered_alpha(self._hwnd, 0, 0, 0x2)
+                show_window = ctypes.windll.user32.ShowWindow
+                show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                show_window.restype = ctypes.c_bool
+                # SW_HIDE，确保透明无边框窗口不会继续参与桌面合成。
+                show_window(self._hwnd, 0)
+            except Exception as e:
+                print(f"覆盖层隐藏警告: {e}")
 
     def _setup_labels(self):
         with mss.mss() as sct:
@@ -886,6 +1097,7 @@ class OverlayApp:
                     self.show_status(data)
                 elif cmd == "CLEAR":
                     self.clear_display()
+                    log_engine_event("覆盖层窗口已处理 CLEAR")
         except queue.Empty:
             pass
         finally:
@@ -893,18 +1105,27 @@ class OverlayApp:
 
     def clear_display(self):
         if self.hide_timer:
-            self.root.after_cancel(self.hide_timer)
+            try:
+                self.root.after_cancel(self.hide_timer)
+            except tk.TclError:
+                pass
             self.hide_timer = None
         for lbl in self.labels.values():
+            lbl.config(text="")
             lbl.place_forget()
         for img_lbl in self.image_labels.values():
+            img_lbl.config(image="")
             img_lbl.place_forget()
+        self.image_photos.clear()
+        # 仅隐藏控件不依赖透明窗口重绘；整个覆盖窗口隐藏后可确保死亡界面等场景也立即清除。
+        self._hide_window()
 
     def show_status(self, text):
         self.clear_display()
         lbl = self.labels['hex_2']
         lbl.config(text=text, fg=COLORS["status"])
         lbl.place(relx=0.5, rely=0.5, anchor="center")
+        self._show_window()
         # 状态提示2秒后消失
         self.hide_timer = self.root.after(2000, self.clear_display)
 
@@ -942,6 +1163,8 @@ class OverlayApp:
 
             # 渲染下方图片UI
             self._render_image_card(key, info)
+
+        self._show_window()
 
 # ================= 4. 控制逻辑 (Controller) =================
 
@@ -1095,7 +1318,7 @@ class InputController(threading.Thread):
         self.flush_input()
         print(f"[监听中...] 当前英雄: {self.current_hero} | F6分析 / F7刷新 / F8手动")
 
-        # 推荐必须持续显示到海克斯界面消失（亮度基准连续确认）才能清除。
+        # 推荐必须持续显示到海克斯界面消失（卡片外框连续确认）才能清除。
         selection_watch = False
         selection_baseline_ready = False
         last_watch_poll = 0.0
@@ -1140,16 +1363,14 @@ class InputController(threading.Thread):
                 time.sleep(0.5)
                 return  # 退出监听，回到 select_hero_phase
 
-            # 低频监测海克斯界面是否消失：首次先采亮度基准，之后连续确认变亮才清除
+            # 低频监测海克斯界面是否消失：首次先采卡片外框基准，之后连续确认外框消失才清除
             if selection_watch and now - last_watch_poll >= SELECTION_POLL_INTERVAL:
                 last_watch_poll = now
                 if not selection_baseline_ready:
-                    self.analyzer.prime_selection_baseline()
-                    selection_baseline_ready = True
+                    selection_baseline_ready = self.analyzer.prime_selection_baseline()
                 elif self.analyzer.check_selection_completed():
                     selection_watch = False
                     self.queue.put({"cmd": "CLEAR"})
-                    self.queue.put({"cmd": "STATUS", "data": "✓ 已选完，推荐已关闭"})
 
             time.sleep(0.05)
 

@@ -195,9 +195,10 @@ def _transform_region(region, matrix):
     }
 
 
-def compose_overlay(source, results, monitor):
+def compose_overlay(source, results, monitor, matrix=None):
     """生成只含文字和推荐图片的透明覆盖层。"""
-    matrix = detect_source_transform(source, monitor)
+    if matrix is None:
+        matrix = detect_source_transform(source, monitor)
     canvas = Image.new("RGBA", (monitor["width"], monitor["height"]), (0, 0, 0, 0))
     source_regions = get_source_regions(source.width, source.height)
     source_overlay_regions = get_display_overlay_regions(source.width, source.height)
@@ -253,7 +254,9 @@ class Win32OverlayPreview:
 
     WM_CLOSE = 0x0010
     WM_HOTKEY = 0x0312
+    WM_TIMER = 0x0113
     WM_DESTROY = 0x0002
+    CLICK_TIMER_ID = 2
     CTRL_C_EVENT = 0
     CTRL_BREAK_EVENT = 1
     VK_ESCAPE = 0x1B
@@ -270,16 +273,65 @@ class Win32OverlayPreview:
     AC_SRC_OVER = 0
     AC_SRC_ALPHA = 1
 
-    def __init__(self, image, monitor):
+    def __init__(self, image, monitor, card_regions=None):
         self.image = image
         self.width = monitor["width"]
         self.height = monitor["height"]
         self.left = monitor["left"]
         self.top = monitor["top"]
         self.hwnd = None
+        self.card_regions = card_regions or {}
+        self._left_mouse_down = False
+        self._pressed_card = None
         self._console_handler = None
         self._class_name = f"LolHexTransparentOverlay_{id(self)}"
         self._wnd_proc = self._make_wnd_proc()
+
+    @staticmethod
+    def _cursor_position():
+        class CursorPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        point = CursorPoint()
+        get_cursor_pos = ctypes.windll.user32.GetCursorPos
+        get_cursor_pos.argtypes = [ctypes.POINTER(CursorPoint)]
+        get_cursor_pos.restype = wintypes.BOOL
+        if not get_cursor_pos(ctypes.byref(point)):
+            return None
+        return point.x, point.y
+
+    @staticmethod
+    def _is_left_mouse_down():
+        get_async_key_state = ctypes.windll.user32.GetAsyncKeyState
+        get_async_key_state.argtypes = [ctypes.c_int]
+        get_async_key_state.restype = ctypes.c_short
+        return bool(get_async_key_state(0x01) & 0x8000)
+
+    def _card_at_point(self, x, y):
+        local_x = x - self.left
+        local_y = y - self.top
+        for key, region in self.card_regions.items():
+            if (region["left"] <= local_x < region["left"] + region["width"] and
+                    region["top"] <= local_y < region["top"] + region["height"]):
+                return key
+        return None
+
+    def _close_after_card_click(self, key):
+        print(f"预览测试：点击 {key}，覆盖层已关闭。")
+        ctypes.windll.user32.PostMessageW(self.hwnd, self.WM_CLOSE, 0, 0)
+
+    def _poll_card_click(self):
+        left_mouse_down = self._is_left_mouse_down()
+        if left_mouse_down and not self._left_mouse_down:
+            position = self._cursor_position()
+            self._pressed_card = self._card_at_point(*position) if position else None
+        elif not left_mouse_down and self._left_mouse_down:
+            pressed_card = self._pressed_card
+            self._pressed_card = None
+            position = self._cursor_position()
+            if pressed_card and position and self._card_at_point(*position) == pressed_card:
+                self._close_after_card_click(pressed_card)
+        self._left_mouse_down = left_mouse_down
 
     def _make_wnd_proc(self):
         user32 = ctypes.windll.user32
@@ -289,6 +341,9 @@ class Win32OverlayPreview:
         unregister_hot_key = user32.UnregisterHotKey
         unregister_hot_key.argtypes = [wintypes.HWND, ctypes.c_int]
         unregister_hot_key.restype = wintypes.BOOL
+        kill_timer = user32.KillTimer
+        kill_timer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+        kill_timer.restype = wintypes.BOOL
         post_quit_message = user32.PostQuitMessage
         post_quit_message.argtypes = [ctypes.c_int]
         post_quit_message.restype = None
@@ -315,7 +370,11 @@ class Win32OverlayPreview:
             if msg == self.WM_HOTKEY and wparam == 1:
                 destroy_window(hwnd)
                 return 0
+            if msg == self.WM_TIMER and wparam == self.CLICK_TIMER_ID:
+                self._poll_card_click()
+                return 0
             if msg == self.WM_DESTROY:
+                kill_timer(hwnd, self.CLICK_TIMER_ID)
                 unregister_hot_key(hwnd, 1)
                 post_quit_message(0)
                 return 0
@@ -555,6 +614,11 @@ class Win32OverlayPreview:
         if not user32.RegisterHotKey(self.hwnd, 1, 0, self.VK_ESCAPE):
             print("警告：Esc 全局退出热键注册失败，请在终端按 Ctrl+C 退出")
         user32.ShowWindow(self.hwnd, self.SW_SHOWNOACTIVATE)
+        self._left_mouse_down = self._is_left_mouse_down()
+        user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
+        if not user32.SetTimer(self.hwnd, self.CLICK_TIMER_ID, 25, None):
+            print("警告：卡片点击监听启动失败，仍可按 Esc 或 Ctrl+C 退出")
 
         console_handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
 
@@ -604,10 +668,16 @@ def run_preview(screenshot_path, hero_query=None):
     print(f"英雄匹配: {hero or '未指定，仅显示 OCR 预览状态'}")
     for key, result in results.items():
         print(f"{key}: {result.get('text', '')}")
-    preview = compose_overlay(source, results, monitor)
-    print("透明覆盖层已显示；当前桌面内容保持不变，按 Esc 或 Ctrl+C 退出。")
+    matrix = detect_source_transform(source, monitor)
+    preview = compose_overlay(source, results, monitor, matrix)
+    source_frame_regions = core.calculate_frame_regions(source.width, source.height)
+    card_regions = {
+        key: _transform_region(frame["capture"], matrix)
+        for key, frame in source_frame_regions.items()
+    }
+    print("透明覆盖层已显示；点击任一海克斯卡片可测试即时关闭，Esc 或 Ctrl+C 退出。")
     try:
-        Win32OverlayPreview(preview, monitor).show()
+        Win32OverlayPreview(preview, monitor, card_regions).show()
     finally:
         analyzer.executor.shutdown(wait=False, cancel_futures=True)
 

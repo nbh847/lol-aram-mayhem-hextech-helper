@@ -13,6 +13,7 @@ import time
 import datetime
 import math
 import traceback
+import ctypes
 
 # ============ 路径初始化 (兼容 PyInstaller 打包) ============
 
@@ -23,6 +24,7 @@ sys.path.insert(0, BASE_DIR)
 # ============ 延迟导入 (需要 path 已设置) ============
 
 import keyboard
+import psutil
 from PIL import Image, ImageDraw
 import pystray
 
@@ -93,7 +95,10 @@ class GUIController(threading.Thread):
         self._last_f8 = 0
         self._overlay_active = False
         self._last_overlay_check = 0.0
-        self._overlay_check_interval = 0.35
+        self._overlay_check_interval = 0.3
+        self._selection_baseline_ready = False
+        self._left_mouse_down = False
+        self._pressed_card = None
 
     def run(self):
         """主循环: 自动检测 → 监听"""
@@ -113,9 +118,101 @@ class GUIController(threading.Thread):
         self.analyzer.clear_analysis_cache()
         self.overlay_queue.put({"cmd": "CLEAR"})
         self._overlay_active = False
+        self._selection_baseline_ready = False
         self._last_overlay_check = 0.0
+        self._pressed_card = None
         if reason:
             print(reason)
+
+    @staticmethod
+    def _get_foreground_process_name():
+        """返回当前前台窗口所属进程名；获取失败时返回空字符串。"""
+        try:
+            user32 = ctypes.windll.user32
+            get_foreground_window = user32.GetForegroundWindow
+            get_foreground_window.argtypes = []
+            get_foreground_window.restype = ctypes.c_void_p
+            hwnd = get_foreground_window()
+            if not hwnd:
+                return ""
+            pid = ctypes.c_ulong()
+            get_window_thread_process_id = user32.GetWindowThreadProcessId
+            get_window_thread_process_id.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)
+            ]
+            get_window_thread_process_id.restype = ctypes.c_ulong
+            get_window_thread_process_id(hwnd, ctypes.byref(pid))
+            return psutil.Process(pid.value).name().lower()
+        except (OSError, psutil.Error):
+            return ""
+
+    @staticmethod
+    def _get_cursor_position():
+        """返回鼠标的屏幕坐标；获取失败时返回 None。"""
+        class Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        point = Point()
+        try:
+            get_cursor_pos = ctypes.windll.user32.GetCursorPos
+            get_cursor_pos.argtypes = [ctypes.POINTER(Point)]
+            get_cursor_pos.restype = ctypes.c_bool
+            if not get_cursor_pos(ctypes.byref(point)):
+                return None
+        except OSError:
+            return None
+        return point.x, point.y
+
+    @staticmethod
+    def _card_at_point(x, y):
+        """返回屏幕坐标所在的海克斯卡片 key。"""
+        from main import FRAME_REGIONS
+
+        for key, frame in FRAME_REGIONS.items():
+            region = frame["capture"]
+            if (region["left"] <= x < region["left"] + region["width"] and
+                    region["top"] <= y < region["top"] + region["height"]):
+                return key
+        return None
+
+    @staticmethod
+    def _is_left_mouse_down():
+        get_async_key_state = ctypes.windll.user32.GetAsyncKeyState
+        get_async_key_state.argtypes = [ctypes.c_int]
+        get_async_key_state.restype = ctypes.c_short
+        return bool(get_async_key_state(0x01) & 0x8000)
+
+    def _check_card_click(self):
+        """完整点击游戏中的海克斯卡片后立即清除推荐覆盖层。"""
+        try:
+            left_mouse_down = self._is_left_mouse_down()
+        except OSError:
+            return
+
+        if not self._overlay_active:
+            self._left_mouse_down = left_mouse_down
+            self._pressed_card = None
+            return
+
+        if left_mouse_down and not self._left_mouse_down:
+            position = self._get_cursor_position()
+            if (position and
+                    self._get_foreground_process_name() == "league of legends.exe"):
+                self._pressed_card = self._card_at_point(*position)
+            else:
+                self._pressed_card = None
+        elif not left_mouse_down and self._left_mouse_down:
+            pressed_card = self._pressed_card
+            self._pressed_card = None
+            position = self._get_cursor_position()
+            if (pressed_card and position and
+                    self._get_foreground_process_name() == "league of legends.exe" and
+                    self._card_at_point(*position) == pressed_card):
+                self._clear_overlay_and_cache(
+                    f"检测到点击海克斯卡片 {pressed_card}，已立即清除推荐覆盖层"
+                )
+
+        self._left_mouse_down = left_mouse_down
 
     def _check_overlay_closed(self, now):
         """低频检查海克斯界面是否已因用户选择而消失。"""
@@ -125,7 +222,9 @@ class GUIController(threading.Thread):
             return
         self._last_overlay_check = now
         try:
-            if self.analyzer.check_selection_completed():
+            if not self._selection_baseline_ready:
+                self._selection_baseline_ready = self.analyzer.prime_selection_baseline()
+            elif self.analyzer.check_selection_completed():
                 self._clear_overlay_and_cache(
                     "检测到海克斯选择界面已关闭，已清除推荐覆盖层"
                 )
@@ -228,6 +327,7 @@ class GUIController(threading.Thread):
 
         while self.running:
             now = time.time()
+            self._check_card_click()
             self._check_overlay_closed(now)
 
             # F6 - 分析海克斯
@@ -241,8 +341,22 @@ class GUIController(threading.Thread):
                     self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]..."})
                     print(f"正在分析: {self.current_hero}...")
                     results = self.analyzer.analyze(self.current_hero)
+                    if not any(item.get("valid") for item in results.values()):
+                        self._clear_overlay_and_cache()
+                        self.overlay_queue.put({
+                            "cmd": "STATUS",
+                            "data": "❌ 未检测到海克斯选项\n请对准选择界面后重按 F6",
+                        })
+                        self._gui(
+                            event="status",
+                            status="no_augment_found",
+                            hero=self.current_hero,
+                        )
+                        print("分析未检测到有效海克斯选项")
+                        continue
                     self.overlay_queue.put({"cmd": "UPDATE", "data": results})
                     self._overlay_active = bool(results)
+                    self._selection_baseline_ready = self.analyzer.prime_selection_baseline()
                     self._last_overlay_check = time.time()
                     self._gui(event="status", status="analyzed", hero=self.current_hero)
                     print(f"分析完成: {self.current_hero}")
@@ -1236,6 +1350,7 @@ class LauncherApp:
                 "listening":        ("监听中", self.SUCCESS),
                 "analyzing":        ("分析中...", self.ACCENT),
                 "analyzed":         ("分析完成", self.SUCCESS),
+                "no_augment_found": ("未检测到海克斯", self.WARNING),
                 "refreshing":       ("刷新英雄...", self.WARNING),
                 "no_hero_warning":  ("未锁定英雄", self.ERROR),
                 "idle":             ("运行中 (无英雄)", self.TEXT_DIM),
