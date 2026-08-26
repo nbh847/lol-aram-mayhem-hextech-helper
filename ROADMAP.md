@@ -1,6 +1,6 @@
 # 项目路线图
 
-更新时间：2026-08-24
+更新时间：2026-08-26
 
 ## 当前阶段
 
@@ -71,6 +71,7 @@
 - 已新增 F6 即时反馈：已锁定英雄时按 F6，覆盖层中央立即显示「匹配海克斯中...」；成功时由推荐结果直接替换，空结果或分析异常时立即 `CLEAR`。普通 `STATUS`（包括 F7）仍不唤醒全屏覆盖层。中央提示布局、`ANALYZING → UPDATE` 和 `ANALYZING → CLEAR` 控制流通过。
 - 已修复选择后逻辑已处理 `CLEAR` 但推荐图案和文字仍残留：真实包日志在 21:22:28 明确记录 `CLEAR`，证明检测链路已生效，缺陷位于透明窗口/DWM 合成责任层。隐藏流程改为先将 Tk 窗口缩成 `1×1` 并刷新，再执行 `withdraw + alpha=0 + SW_HIDE + DwmFlush`；显示时恢复全屏几何并重新应用透明键。窗口几何生命周期和 13 个 Python 文件 AST 解析通过，重新打包 `dist/build_1787578286/ARAMHelper`，待真实游戏验证。
 - 已修复“F6 分析期间先选完海克斯，迟到结果渲染后永不消失”的竞态：F6 开始时保存卡片外框基准，OCR 返回后、`UPDATE` 前再次采样；至少两张卡片已消失时直接清缓存并 `CLEAR`，丢弃迟到结果，不再用选择完成后的背景覆盖基准。界面仍在时沿用 F6 基准进入后续监测。两张/单张外框消失判断及正常 `ANALYZING → UPDATE`、提前选择 `ANALYZING → CLEAR` 控制流通过，重新打包 `dist/build_1787579325/ARAMHelper`，待真实游戏验证。
+- 已建立本地 `release/` 发布产物目录约定并加入 Git 忽略；使用 Python 3.12.13 与 PyInstaller 6.21.0 重新构建当前助手，将完整可运行目录打包为 `release/ARAMHelper_v1.0.0.zip`（114,734,178 字节），必要运行文件和 ZIP 内容检查通过。
 
 ## 进行中
 
@@ -92,6 +93,7 @@
 
 ## 最近验证
 
+- 2026-08-26：13 个源码 Python 文件 AST 解析通过，`pip check` 无依赖冲突；PyInstaller 重新构建 `dist/build_1787747171/ARAMHelper`（254.0 MB），核对 EXE、三个正式数据文件、三张推荐模板和 Tkinter/Tcl/Tk 运行时共 10 项必要文件齐全。生成 `release/ARAMHelper_v1.0.0.zip`，SHA-256 为 `2D0D1A2A050EBDC2AA37CEFA4CFD4D8CDB806AA9C2F3C6DFAD719F544475890C`；未执行真实游戏、OCR、LCU 或干净机器启动验证。
 - 2026-08-24：针对用户反馈“渲染前已选择，渲染后永久残留”，确认原流程在 OCR 返回后才采选择基准，会把已关闭界面当作基准。新增分析前基准与渲染前门禁：两张卡片消失判定已完成选择并禁止 `UPDATE`，一张瞬时消失不拦截。组件与 GUI 控制流、13 个 Python 文件 AST 解析通过；PyInstaller 打包 `dist/build_1787579325/ARAMHelper`（254.0 MB），九项必要运行文件齐全，待真实游戏验证。
 - 2026-08-24：实现 F6「匹配海克斯中...」即时过渡提示，验证分析调用前提示已入队，成功结果替换、异常结果清除。随后根据用户反馈读取 `build_1787564804/ARAMHelper/engine_debug.log`，确认选中海克斯时已处理 `CLEAR` 但窗口视觉残留；改为收缩窗口表面后强制隐藏并等待 DWM 合成。AST、提示布局、两种分析消息序列和窗口显示/隐藏几何顺序通过；PyInstaller 打包 `dist/build_1787578286/ARAMHelper`（254.0 MB），九项必要运行文件齐全，待真实游戏验证。
 - 2026-08-24：读取运行进程确认同时存在两个 `ARAMHelper.exe`，其中 PID 17964 的启动时间早于禁止全屏状态提示的修复包，证明旧进程仍在响应 F6/F7；当前会话因旧进程管理员权限无法代为结束。新增 `Local\\ARAMHextechHelperSingleInstance` 命名互斥锁，首次获取成功、同会话重复获取被拦截；13 个 Python 文件 AST 解析通过，PyInstaller 打包 `dist/build_1787564804/ARAMHelper`（254.0 MB），九项必要运行文件齐全。打包后复查当前已无 `ARAMHelper.exe` 进程，可直接启动新包验证。

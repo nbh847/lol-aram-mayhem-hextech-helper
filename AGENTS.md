@@ -18,6 +18,7 @@
 - `docs/`：项目说明和演示图片。
 - `runtime_hooks/`：PyInstaller 运行时 hook，只放打包所需的 hook。
 - `build.py`：PyInstaller 打包脚本。
+- `release/`：本地 GitHub Release 压缩包输出目录，只放可直接上传的版本化 ZIP，始终忽略且不提交。
 
 本地虚拟环境、构建产物和缓存（例如 `.venv/`、`dist/`、`build/`、`*.spec`、`__pycache__/`）默认不提交。不要把临时脚本、日志或下载文件放入源码目录；确需保留时先约定目录和清理时机。
 
