@@ -50,6 +50,8 @@ RECOMMENDATION_CROP = (120, 50, 1620, 840)
 ANALYSIS_SIGNATURE_SIZE = (96, 18)
 ANALYSIS_CHANGE_THRESHOLD = 0.20
 ANALYSIS_CHANGED_REGION_COUNT = 2
+# 模糊匹配采纳分数 (fuzz.ratio) 阈值: 单字错误的典型分数 (3字名66.7/4字名75) 需可恢复
+MATCH_SCORE_THRESHOLD = 60
 SELECTION_CONFIRMATION_POLLS = 2
 SELECTION_POLL_INTERVAL = 0.3
 # 实际游戏中未 hover 的卡框可能变暗；评分同时考虑高亮像素占比和四条边的连续线覆盖率，
@@ -700,10 +702,11 @@ class GameAnalyzer:
         return completed
 
     def _warmup(self):
-        """用小图预热 OCR 引擎, 消除首次 F6 的冷启动延迟"""
+        """用 OCR 区域的真实尺寸预热完整推理链路, 消除首次 F6 的冷启动延迟"""
         try:
-            dummy = np.zeros((48, 320), dtype=np.uint8)
+            dummy = np.zeros((120, 640), dtype=np.uint8)
             self.ocr(dummy)
+            self.ocr(dummy, use_det=False, use_cls=False, use_rec=True)
             print(f"OCR 引擎预热完成 (CPU: {self._cpu_count} 线程, {'并发' if self._use_parallel else '串行'}模式)")
         except Exception:
             pass
@@ -763,15 +766,68 @@ class GameAnalyzer:
 
         return images
 
+    def _ocr_line_text(self, img):
+        """整行识别 (跳过文本检测模型)。
+
+        OCR 区域截图内只有一行海克斯标题, 直接整行送识别模型约 0.02s;
+        完整 det+rec 单卡约 0.5~1s, 只留作匹配失败时的兜底。"""
+        try:
+            res, _ = self.ocr(img, use_det=False, use_cls=False, use_rec=True)
+            return "".join(item[0] for item in res) if res else ""
+        except Exception:
+            return ""
+
+    def _ocr_full_text(self, img):
+        """完整 det+rec 识别, 按检测框顺序拼接全部文字。"""
+        try:
+            res, _ = self.ocr(img)
+            return "".join(item[1] for item in res) if res else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _match_text(txt, hero_augments):
+        """精确匹配优先, 失败则 fuzz.ratio 模糊匹配。
+
+        返回 (最佳候选, 分数); 是否采纳由调用方按 MATCH_SCORE_THRESHOLD 取舍。"""
+        if txt in hero_augments:
+            return txt, 100.0
+        match, score = process.extractOne(txt, list(hero_augments.keys()), scorer=fuzz.ratio)
+        return match, score
+
     def _ocr_and_match(self, key, img, hero_cn):
         """对单张已截取的图片执行 OCR 识别 + 数据匹配"""
         try:
             if img is None:
                 return {"key": key, "text": "截图错误", "error": True}
 
-            res_ocr, _ = self.ocr(img)
-            txt = "".join([line[1] for line in res_ocr]) if res_ocr else ""
+            txt = self._ocr_line_text(img)
             txt = txt.replace(" ", "").replace(".", "")
+
+            hero_augments = self.dm.hero_data.get(hero_cn, {})
+            match_name = None
+            best = None
+            score = 0.0
+
+            def try_match(text):
+                nonlocal match_name, best, score
+                best, score = self._match_text(text, hero_augments)
+                if score > MATCH_SCORE_THRESHOLD:
+                    match_name = best
+
+            if not hero_augments:
+                # 保持原语义: 无英雄数据时仍完整识别一次, 以区分「无文字」和「无数据」
+                if not txt:
+                    txt = self._ocr_full_text(img).replace(" ", "").replace(".", "")
+            elif txt:
+                try_match(txt)
+                if match_name is None:
+                    # 整行识别没匹配上才跑完整 det+rec, 同一次 F6 内多一次识别机会
+                    full_txt = self._ocr_full_text(img)
+                    full_txt = full_txt.replace(" ", "").replace(".", "")
+                    if full_txt and full_txt != txt:
+                        txt = full_txt
+                        try_match(txt)
 
             res = {
                 "key": key, "valid": False, "rank": 999, 
@@ -784,22 +840,10 @@ class GameAnalyzer:
                 print(f"OCR 失败 ({key}): 未检测到文字")
                 return res
 
-            hero_augments = self.dm.hero_data.get(hero_cn, {})
             if not hero_augments:
                 res["text"] = "无数据"
                 res["error"] = True
                 return res
-
-            match_name = None
-            
-            # 1. 精确匹配 (O(1))
-            if txt in hero_augments:
-                match_name = txt
-            else:
-                # 2. 模糊匹配 (使用精确比例 fuzz.ratio，避免子串过分匹配)
-                match, score = process.extractOne(txt, list(hero_augments.keys()), scorer=fuzz.ratio)
-                if score > 60:
-                    match_name = match
 
             if match_name:
                 info = hero_augments[match_name]
@@ -817,7 +861,7 @@ class GameAnalyzer:
                 res["error"] = True
                 print(
                     f"OCR 失败 ({key}): 原始文本={txt!r}, "
-                    f"最佳匹配={match!r}, 分数={score:.1f}"
+                    f"最佳匹配={best!r}, 分数={score:.1f}"
                 )
             
             return res
