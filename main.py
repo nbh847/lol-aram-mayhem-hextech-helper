@@ -174,7 +174,8 @@ def log_engine_event(text):
     """打包版无控制台，界面清除诊断写入运行目录日志便于排查。"""
     try:
         with open(os.path.join(BASE_DIR, "engine_debug.log"), "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+            timestamp = time.time()
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}.{int(timestamp % 1 * 1000):03d} {text}\n")
     except OSError:
         pass
 
@@ -1174,8 +1175,15 @@ class OverlayApp:
                 elif cmd == "STATUS":
                     self.show_status(data)
                 elif cmd == "CLEAR":
+                    started_at = time.monotonic()
                     self.clear_display()
-                    log_engine_event("覆盖层窗口已处理 CLEAR")
+                    requested_at = msg.get("requested_at")
+                    queue_ms = (started_at - requested_at) * 1000 if requested_at is not None else None
+                    log_engine_event(
+                        f"覆盖层窗口已处理 CLEAR: 原因={msg.get('reason') or '未指定'}, "
+                        f"请求至处理={f'{queue_ms:.0f}ms' if queue_ms is not None else '未知'}, "
+                        f"窗口处理={(time.monotonic() - started_at) * 1000:.0f}ms"
+                    )
         except queue.Empty:
             pass
         finally:

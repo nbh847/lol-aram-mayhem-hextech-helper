@@ -124,6 +124,11 @@ class GUIController(threading.Thread):
         self._selection_baseline_ready = False
         self._left_mouse_down = False
         self._pressed_card = None
+        self._last_click_poll = None
+        self._last_hero_poll = 0.0
+        self._hero_poll_interval = 2.0
+        self._last_lcu_reconnect = 0.0
+        self._lcu_reconnect_interval = 30.0
 
     def run(self):
         """主循环: 自动检测 → 监听"""
@@ -140,8 +145,12 @@ class GUIController(threading.Thread):
 
     def _clear_overlay_and_cache(self, reason=None):
         """清除覆盖层和当前轮次识别缓存。"""
+        from main import log_engine_event
+
+        queued_at = time.monotonic()
+        log_engine_event(f"请求清除覆盖层: 原因={reason or '手动或状态切换'}")
         self.analyzer.clear_analysis_cache()
-        self.overlay_queue.put({"cmd": "CLEAR"})
+        self.overlay_queue.put({"cmd": "CLEAR", "reason": reason, "requested_at": queued_at})
         self._overlay_active = False
         self._selection_baseline_ready = False
         self._last_overlay_check = 0.0
@@ -209,6 +218,14 @@ class GUIController(threading.Thread):
 
     def _check_card_click(self):
         """完整点击游戏中的海克斯卡片后立即清除推荐覆盖层。"""
+        from main import log_engine_event
+
+        now = time.monotonic()
+        if self._overlay_active and self._last_click_poll is not None:
+            gap = now - self._last_click_poll
+            if gap >= 0.15:
+                log_engine_event(f"点击检测采样间隔过长: {gap * 1000:.0f}ms")
+        self._last_click_poll = now
         try:
             left_mouse_down = self._is_left_mouse_down()
         except OSError:
@@ -221,18 +238,25 @@ class GUIController(threading.Thread):
 
         if left_mouse_down and not self._left_mouse_down:
             position = self._get_cursor_position()
-            if (position and
-                    self._get_foreground_process_name() == "league of legends.exe"):
+            foreground = self._get_foreground_process_name()
+            if position and foreground == "league of legends.exe":
                 self._pressed_card = self._card_at_point(*position)
+                log_engine_event(f"游戏点击按下: 坐标={position}, 卡片={self._pressed_card}")
             else:
                 self._pressed_card = None
         elif not left_mouse_down and self._left_mouse_down:
             pressed_card = self._pressed_card
             self._pressed_card = None
             position = self._get_cursor_position()
+            foreground = self._get_foreground_process_name()
+            released_card = self._card_at_point(*position) if position else None
+            if pressed_card or foreground == "league of legends.exe":
+                log_engine_event(
+                    f"游戏点击松开: 坐标={position}, 按下卡片={pressed_card}, "
+                    f"松开卡片={released_card}, 游戏前台={foreground == 'league of legends.exe'}"
+                )
             if (pressed_card and position and
-                    self._get_foreground_process_name() == "league of legends.exe" and
-                    self._card_at_point(*position) == pressed_card):
+                    foreground == "league of legends.exe" and released_card == pressed_card):
                 self._clear_overlay_and_cache(
                     f"检测到点击海克斯卡片 {pressed_card}，已立即清除推荐覆盖层"
                 )
@@ -305,6 +329,37 @@ class GUIController(threading.Thread):
             return validated
         return None
 
+    def _refresh_hero_from_lcu(self, now):
+        """立即尝试跟随 LCU 当前英雄，选人阶段重随/交换/替补席换英雄后自动切换。"""
+        if not self.lcu:
+            return
+        if not self.lcu.is_connected():
+            # 客户端可能稍后才启动，低频重试连接，避免频繁扫描进程
+            if now - self._last_lcu_reconnect < self._lcu_reconnect_interval:
+                return
+            self._last_lcu_reconnect = now
+            if not self.lcu.connect():
+                return
+        hero, source = self._try_auto_detect()
+        if not hero or hero == self.current_hero:
+            return
+        old = self.current_hero
+        if old is not None:
+            self._clear_overlay_and_cache(
+                f"检测到英雄切换 ({source}): {old} → {hero}，已清除推荐覆盖层"
+            )
+        self.current_hero = hero
+        print(f"英雄已自动切换 ({source}): {old or '未指定'} → {hero}")
+        self._gui(event="hero_found", hero=hero, source=source)
+        self.overlay_queue.put({"cmd": "STATUS", "data": f"已切换: {hero}\n按 F6 分析"})
+
+    def _check_hero_refresh(self, now):
+        """监听循环内低频轮询，让英雄状态跟随客户端。"""
+        if now - self._last_hero_poll < self._hero_poll_interval:
+            return
+        self._last_hero_poll = now
+        self._refresh_hero_from_lcu(now)
+
     # ---------- 阶段1: 自动检测英雄 ----------
 
     def _auto_detect_phase(self):
@@ -354,10 +409,13 @@ class GUIController(threading.Thread):
             now = time.time()
             self._check_card_click()
             self._check_overlay_closed(now)
+            self._check_hero_refresh(now)
 
             # F6 - 分析海克斯
             if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
                 self._last_f6 = now
+                # 分析前刷新英雄，避免换英雄后仍按旧英雄推荐
+                self._refresh_hero_from_lcu(now)
                 if not self.current_hero:
                     self.overlay_queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 获取"})
                     self._gui(event="status", status="no_hero_warning")
