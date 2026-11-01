@@ -62,6 +62,14 @@ SELECTION_FRAME_LINE_COVERAGE = 0.20
 SELECTION_FRAME_ABSENT_CARD_COUNT = 2
 SELECTION_FRAME_MIN_CHANNEL = 105.0
 SELECTION_FRAME_MAX_CHANNEL_SPREAD = 110.0
+# 标题条亮度通道：外框检测依赖卡框亮色像素，暗色对局场景会把卡框压暗到
+# 存在阈值之下（2026-10-31 实测 6/8 轮外框分数 0.04~0.18），整轮失效。
+# 海克斯界面的卡片面板自身近黑、不随背后场景变暗，关闭后露出游戏画面
+# 亮度跳升，以此作为并行清除信号。只可能漏报（极暗场景残留，可 F7 手动清）。
+SELECTION_STRIP_TOP = 570      # 参考画布绝对 y：推荐文字底缘(~552)之下、描述区亮化(~640)之上
+SELECTION_STRIP_HEIGHT = 60
+SELECTION_STRIP_INSET = 36     # 左右各避开卡框边带
+SELECTION_STRIP_DELTA = 45.0
 ANALYSIS_STABILITY_ATTEMPTS = 3
 ANALYSIS_STABILITY_INTERVAL = 0.08
 ANALYSIS_RETRY_ATTEMPTS = 2
@@ -129,6 +137,30 @@ def get_frame_regions():
 
 
 FRAME_REGIONS = get_frame_regions()
+
+# 标题条亮度采样区：每张卡内部的一条横带，随参考画布统一变换
+REFERENCE_STRIP_REGIONS = {
+    key: {
+        'top': SELECTION_STRIP_TOP,
+        'left': card['left'] + SELECTION_STRIP_INSET,
+        'width': card['width'] - 2 * SELECTION_STRIP_INSET,
+        'height': SELECTION_STRIP_HEIGHT,
+    }
+    for key, card in REFERENCE_FRAME_CARD_REGIONS.items()
+}
+
+
+def get_strip_regions():
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+    scale, offset_x, offset_y = get_ui_transform(mon['width'], mon['height'])
+    return {
+        key: _scale_reference_region(region, scale, offset_x, offset_y)
+        for key, region in REFERENCE_STRIP_REGIONS.items()
+    }
+
+
+STRIP_REGIONS = get_strip_regions()
 
 def calculate_overlay_regions(width, height):
     """
@@ -472,8 +504,11 @@ class GameAnalyzer:
         self._display_frame_scores = {}
         self._selection_change_polls = 0
         self._selection_absent_streaks = {}
+        self._strip_baselines = {}
+        self._strip_streaks = {}
         self._selection_check_count = 0
         self._last_capture_stable = False
+        self._last_baseline_fail_log = 0.0
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
         self._warmup()
 
@@ -483,9 +518,17 @@ class GameAnalyzer:
         self._analysis_cache.clear()
         self._round_signatures.clear()
         self._display_frame_scores.clear()
+        self._strip_baselines.clear()
+        self._strip_streaks.clear()
         self._selection_change_polls = 0
         self._selection_absent_streaks.clear()
         self._selection_check_count = 0
+        self._last_capture_stable = False
+
+    def clear_ocr_cache(self):
+        """仅清除英雄相关的 OCR 缓存，保留与英雄无关的卡片外框基准。"""
+        self._analysis_cache.clear()
+        self._round_signatures.clear()
         self._last_capture_stable = False
 
     @staticmethod
@@ -606,20 +649,107 @@ class GameAnalyzer:
     def _store_frame_baseline(self, scores):
         if not scores:
             return False
-        present_count = sum(
-            score >= SELECTION_FRAME_PRESENT_SCORE for score in scores.values()
-        )
-        if present_count < SELECTION_FRAME_ABSENT_CARD_COUNT:
+        # 只跟踪基准时确实存在的卡框：基准时已低于存在阈值的卡框
+        # (悬停变暗/渲染不全)每轮都会被计为"消失"，与其他卡一叠加
+        # 就会在界面仍打开时误判关闭；存在卡不足两张时放弃本次基准。
+        present_scores = {
+            key: score for key, score in scores.items()
+            if score >= SELECTION_FRAME_PRESENT_SCORE
+        }
+        if len(present_scores) < SELECTION_FRAME_ABSENT_CARD_COUNT:
+            self._log_baseline_failure(scores)
             return False
-        self._display_frame_scores = dict(scores)
+        self._display_frame_scores = present_scores
         self._selection_change_polls = 0
-        self._selection_absent_streaks = {key: 0 for key in scores}
+        self._selection_absent_streaks = {key: 0 for key in present_scores}
         self._selection_check_count = 0
-        log_engine_event(f"卡片外框基准: {scores}")
+        log_engine_event(
+            f"卡片外框基准: {scores} (跟踪: {sorted(present_scores)})"
+        )
         return True
 
+    def _log_baseline_failure(self, scores):
+        """基准采集失败低频记日志：失败态每 0.3 秒重试，避免刷屏。"""
+        now = time.monotonic()
+        if now - self._last_baseline_fail_log < 2.0:
+            return
+        self._last_baseline_fail_log = now
+        log_engine_event(f"卡片外框基准采集失败(存在卡不足): {scores}")
+
+    def capture_strip_luminances(self):
+        """截图三条标题条带，返回每张卡的平均亮度。"""
+        lums = {}
+        try:
+            with mss.mss() as sct:
+                for key, region in STRIP_REGIONS.items():
+                    monitor = {
+                        'top': int(region['top']),
+                        'left': int(region['left']),
+                        'width': int(region['width']),
+                        'height': int(region['height']),
+                        'mon': 0,
+                    }
+                    raw = sct.grab(monitor)
+                    image = np.asarray(
+                        Image.frombytes('RGB', raw.size, raw.rgb),
+                        dtype=np.float32,
+                    )
+                    lums[key] = float(image.mean())
+        except Exception as e:
+            print(f"标题条截图失败: {e}")
+        return lums
+
+    def _store_strip_baselines(self, lums):
+        """锚定标题条亮度基准；界面打开时卡面板近黑，锚定值即"关"信号起点。"""
+        if not lums:
+            return False
+        self._strip_baselines = dict(lums)
+        self._strip_streaks = {key: 0 for key in lums}
+        log_engine_event(f"标题条亮度基准: { {k: round(v, 1) for k, v in lums.items()} }")
+        return len(lums) >= SELECTION_FRAME_ABSENT_CARD_COUNT
+
+    def _check_strip_revealed(self):
+        """亮度通道：≥2 张卡的标题条亮度持续高于基准 +45 判定界面已关闭。"""
+        if not self._strip_baselines:
+            return False
+        current = self.capture_strip_luminances()
+        if not current:
+            return False
+        bright_keys = []
+        for key, base_lum in self._strip_baselines.items():
+            lum = current.get(key)
+            if lum is None:
+                continue
+            if lum >= base_lum + SELECTION_STRIP_DELTA:
+                self._strip_streaks[key] = self._strip_streaks.get(key, 0) + 1
+                if self._strip_streaks[key] == 1:
+                    log_engine_event(
+                        f"标题条变亮: {key} 当前={lum:.1f} 基准={base_lum:.1f}"
+                    )
+                bright_keys.append(key)
+            else:
+                self._strip_streaks[key] = 0
+
+        confirmed = [
+            key for key, streak in self._strip_streaks.items()
+            if streak >= SELECTION_CONFIRMATION_POLLS
+        ]
+        if len(confirmed) >= SELECTION_FRAME_ABSENT_CARD_COUNT:
+            log_engine_event(
+                f"亮度通道确认界面关闭: 当前={ {k: round(v, 1) for k, v in current.items()} }, "
+                f"基准={ {k: round(v, 1) for k, v in self._strip_baselines.items()} }"
+            )
+            return True
+        return False
+
     def check_selection_completed(self):
-        """检查三张海克斯卡片外框是否已消失。"""
+        """检查海克斯界面是否已消失：卡框消失确认 或 标题条亮度跳升确认。"""
+        frame_confirmed = self._check_frames_absent()
+        strip_confirmed = self._check_strip_revealed()
+        return frame_confirmed or strip_confirmed
+
+    def _check_frames_absent(self):
+        """外框通道：检查三张海克斯卡片外框是否已消失。"""
         self._selection_check_count += 1
         check_count = self._selection_check_count
         if not self._display_frame_scores:
@@ -680,8 +810,10 @@ class GameAnalyzer:
         return completed
 
     def prime_selection_baseline(self):
-        """采样并保存当前三张卡片外框基准。"""
-        return self._store_frame_baseline(self.capture_frame_scores())
+        """采样并保存界面基准：标题条亮度无条件锚定，卡框外框按存在过滤。"""
+        strip_ok = self._store_strip_baselines(self.capture_strip_luminances())
+        frame_ok = self._store_frame_baseline(self.capture_frame_scores())
+        return strip_ok or frame_ok
 
     def selection_closed_since_baseline(self):
         """分析结束前检查选择界面是否已相对 F6 基准关闭。"""
@@ -951,7 +1083,9 @@ class GameAnalyzer:
         print(f"正在分析: {hero_cn}...")
 
         if self._cache_hero != hero_cn:
-            self.clear_analysis_cache()
+            # 英雄切换只作废英雄相关的 OCR 缓存。外框基准与英雄无关，
+            # 若在此被清掉，F6 刚采集的基准会自毁，界面消失兜底整轮失效。
+            self.clear_ocr_cache()
             self._cache_hero = hero_cn
 
         # 先取稳定帧；某些卡片仍未完成渲染时，只重试未完成的识别项。

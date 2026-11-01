@@ -126,7 +126,11 @@ class GUIController(threading.Thread):
         self._pressed_card = None
         self._last_click_poll = None
         self._last_hero_poll = 0.0
-        self._hero_poll_interval = 2.0
+        self._hero_poll_interval_default = 2.0   # 选人/大厅/未知阶段
+        self._hero_poll_interval_ingame = 15.0   # 对局阶段: 英雄不会变化, 退避减少 LCU 请求窗口
+        self._hero_poll_interval = self._hero_poll_interval_default
+        self._last_frame_retry = 0.0
+        self._frame_retry_interval = 2.0
         self._last_lcu_reconnect = 0.0
         self._lcu_reconnect_interval = 30.0
 
@@ -217,7 +221,11 @@ class GUIController(threading.Thread):
         return bool(get_async_key_state(0x01) & 0x8000)
 
     def _check_card_click(self):
-        """完整点击游戏中的海克斯卡片后立即清除推荐覆盖层。"""
+        """完整点击游戏中的海克斯卡片后立即清除推荐覆盖层。
+
+        同一卡片内按下并松开才算点击：按住在卡区外、或按住后拖出卡区
+        松开都不清除，避免误触。点击被采样间隙完整漏掉的场景由亮度
+        通道兜底（界面关闭后约 0.6 秒清除）。"""
         from main import log_engine_event
 
         now = time.monotonic()
@@ -272,8 +280,12 @@ class GUIController(threading.Thread):
         self._last_overlay_check = now
         try:
             if not self._selection_baseline_ready:
-                self._selection_baseline_ready = self.analyzer.prime_selection_baseline()
-            elif self.analyzer.check_selection_completed():
+                # 外框基准未建立时低频补采：0.3 秒重试每次截图上百毫秒，
+                # 会挤占点击采样；亮度通道不依赖外框基准，检测照常进行
+                if now - self._last_frame_retry >= self._frame_retry_interval:
+                    self._last_frame_retry = now
+                    self._selection_baseline_ready = self.analyzer.prime_selection_baseline()
+            if self.analyzer.check_selection_completed():
                 self._clear_overlay_and_cache(
                     "检测到海克斯选择界面已关闭，已清除推荐覆盖层"
                 )
@@ -341,6 +353,13 @@ class GUIController(threading.Thread):
             if not self.lcu.connect():
                 return
         hero, source = self._try_auto_detect()
+        # 对局相关阶段英雄不会变化: 退避轮询, 降低 F6/点击采样撞进 LCU
+        # 请求窗口的概率; 回到选人/大厅后 source 变化, 自动恢复默认间隔。
+        if source in ("GameFlow", "Live API", "InProgress", "GameStart",
+                      "WaitingForStats", "EndOfGame"):
+            self._hero_poll_interval = self._hero_poll_interval_ingame
+        else:
+            self._hero_poll_interval = self._hero_poll_interval_default
         if not hero or hero == self.current_hero:
             return
         old = self.current_hero
@@ -355,6 +374,11 @@ class GUIController(threading.Thread):
 
     def _check_hero_refresh(self, now):
         """监听循环内低频轮询，让英雄状态跟随客户端。"""
+        if self._overlay_active:
+            # 覆盖层显示期间不做 LCU 请求：请求超时可阻塞循环数秒，
+            # 会漏采选卡点击；持续顺延轮询时点，清除后也不会立即请求
+            self._last_hero_poll = now
+            return
         if now - self._last_hero_poll < self._hero_poll_interval:
             return
         self._last_hero_poll = now
@@ -460,9 +484,10 @@ class GUIController(threading.Thread):
                         continue
                     self.overlay_queue.put({"cmd": "UPDATE", "data": results})
                     self._overlay_active = bool(results)
+                    # 无条件重采基准：分析过程可能使 F6 开始时采集的基准失效，
+                    # 旧标志短路会跳过重采导致界面消失兜底整轮失效
                     self._selection_baseline_ready = (
-                        analysis_baseline_ready
-                        or self.analyzer.prime_selection_baseline()
+                        self.analyzer.prime_selection_baseline()
                     )
                     self._last_overlay_check = time.time()
                     self._gui(event="status", status="analyzed", hero=self.current_hero)
